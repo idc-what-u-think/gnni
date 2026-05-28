@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Game Night</title>
+  <link rel="stylesheet" href="/css/main.css">
+  <style>
+    body { font-size: 16px; }
+    #app { padding: 16px; max-width: 480px; margin: 0 auto; min-height: 100vh; }
+    .logo { font-family: var(--font-display); font-size: 28px; font-weight: 700; letter-spacing: 2px; color: var(--text); }
+    .logo span { color: var(--accent); }
+    .avatar-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-top: 8px; }
+    .avatar-opt { aspect-ratio: 1; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 22px; cursor: pointer; border: 3px solid transparent; transition: all 0.2s; }
+    .avatar-opt.selected { border-color: var(--accent); transform: scale(1.1); }
+    .avatar-opt:hover { transform: scale(1.05); }
+    .waiting-players { display: flex; flex-direction: column; gap: 8px; }
+    .spectator-badge { padding: 6px 12px; background: rgba(245,158,11,0.2); color: var(--accent3); border-radius: 8px; font-size: 13px; font-weight: 600; text-align: center; }
+    .number-pad { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .num-btn { padding: 16px 8px; border-radius: 10px; background: var(--surface2); border: 2px solid var(--border); color: var(--text); font-family: var(--font-mono); font-size: 20px; font-weight: 700; cursor: pointer; transition: all 0.2s; text-align: center; }
+    .num-btn:hover { border-color: var(--accent); background: rgba(124,58,237,0.1); }
+    .num-btn.del { color: var(--danger); }
+    .code-display { display: flex; gap: 8px; justify-content: center; margin-bottom: 12px; }
+    .code-dot { width: 48px; height: 56px; border-radius: 10px; background: var(--surface2); border: 2px solid var(--border); display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); font-size: 24px; font-weight: 700; color: var(--accent2); transition: border-color 0.2s; }
+    .code-dot.filled { border-color: var(--accent); }
+    .typing-input { width: 100%; padding: 14px; font-family: var(--font-mono); font-size: 16px; background: var(--surface2); border: 2px solid var(--border); border-radius: 12px; color: var(--text); outline: none; resize: none; line-height: 1.6; box-sizing: border-box; }
+    .typing-input:focus { border-color: var(--accent); }
+    .char-correct { color: var(--success); }
+    .char-wrong { color: var(--danger); text-decoration: underline; }
+    .char-pending { color: var(--text2); }
+    .wyr-opt { padding: 20px; border-radius: 14px; border: 2px solid var(--border); background: var(--surface2); cursor: pointer; transition: all 0.2s; font-size: 16px; font-weight: 500; text-align: center; }
+    .wyr-opt:hover { transform: scale(1.02); }
+    .wyr-opt.a:hover, .wyr-opt.a.selected { border-color: var(--accent); background: rgba(124,58,237,0.15); }
+    .wyr-opt.b:hover, .wyr-opt.b.selected { border-color: var(--accent2); background: rgba(6,182,212,0.15); }
+    .roulette-chambers { display: flex; gap: 6px; justify-content: center; margin: 16px 0; }
+    .chamber { width: 36px; height: 36px; border-radius: 50%; background: var(--surface2); border: 2px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 16px; transition: all 0.3s; }
+    .chamber.loaded { background: rgba(239,68,68,0.2); border-color: var(--danger); }
+    .chamber.fired { background: #374151; border-color: #4b5563; }
+    .img-upload { display: none; }
+    .avatar-upload-btn { width: 80px; height: 80px; border-radius: 50%; border: 2px dashed var(--border); display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; gap: 4px; background: var(--surface2); transition: all 0.2s; font-size: 12px; color: var(--text2); }
+    .avatar-upload-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .avatar-preview { width: 80px; height: 80px; border-radius: 50%; object-fit: cover; border: 2px solid var(--accent); }
+    .your-turn-glow { box-shadow: 0 0 40px rgba(124,58,237,0.6); animation: yourTurnPulse 1s infinite; }
+    @keyframes yourTurnPulse { 0%, 100% { box-shadow: 0 0 20px rgba(124,58,237,0.4); } 50% { box-shadow: 0 0 60px rgba(124,58,237,0.8); } }
+    .tf-options { display: flex; flex-direction: column; gap: 12px; }
+    .tf-btn { font-size: 20px !important; padding: 22px !important; font-weight: 700 !important; }
+    .session-lb-section { margin-top: 20px; }
+    .session-lb-title { font-size: 13px; font-weight: 700; color: var(--text2); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
+  </style>
+</head>
+<body>
+<div class="noise"></div>
+<div id="app">
+
+  <!-- JOIN SCREEN -->
+  <div id="screen-join" class="screen active">
+    <div style="padding: 20px 0 10px; text-align: center;">
+      <div class="logo">GAME<span>NIGHT</span></div>
+      <div class="subtitle mt-2">Local party games. No internet needed.</div>
+    </div>
+
+    <div class="card card-glow mt-4">
+      <div style="display: flex; justify-content: center; margin-bottom: 16px;">
+        <div id="avatarPreviewWrap">
+          <label for="avatarFile" id="avatarUploadBtn" class="avatar-upload-btn">
+            <span style="font-size: 24px;">📷</span>
+            <span>Photo</span>
+          </label>
+          <input type="file" id="avatarFile" class="img-upload" accept="image/*">
+          <img id="avatarPreview" class="avatar-preview" style="display:none;">
+        </div>
+      </div>
+
+      <div class="avatar-grid" id="emojiGrid"></div>
+
+      <div class="input-group mt-4">
+        <label class="input-label">Your Name</label>
+        <input class="input" id="nameInput" placeholder="Enter your name" maxlength="16" autocomplete="off">
+      </div>
+
+      <div class="input-group mt-3">
+        <label class="input-label">Room Code</label>
+        <div class="code-display" id="codeDisplay">
+          <div class="code-dot" id="d0">_</div>
+          <div class="code-dot" id="d1">_</div>
+          <div class="code-dot" id="d2">_</div>
+          <div class="code-dot" id="d3">_</div>
+        </div>
+        <div class="number-pad" id="numPad"></div>
+      </div>
+
+      <button class="btn btn-primary btn-lg btn-block mt-4" id="joinBtn">Join Game</button>
+      <div id="joinError" class="text-danger mt-2" style="font-size: 13px; text-align: center;"></div>
+    </div>
+  </div>
+
+  <!-- WAITING SCREEN -->
+  <div id="screen-waiting" class="screen">
+    <div style="text-align: center; padding: 20px 0;">
+      <div class="logo">GAME<span>NIGHT</span></div>
+      <div class="tag tag-green mt-2">✓ Connected</div>
+    </div>
+
+    <div class="card card-glow">
+      <div style="text-align: center;">
+        <div class="title" style="font-size: 22px;" id="waitRoomCode">Room: ----</div>
+        <div class="subtitle mt-2 pulse">Waiting for host to start...</div>
+      </div>
+      <div class="divider"></div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;">
+        Players (<span id="waitPlayerCount">0</span>)
+      </div>
+      <div class="waiting-players" id="waitPlayerList"></div>
+    </div>
+
+    <button class="btn btn-secondary btn-block mt-3" id="readyBtn" onclick="toggleReady()">Ready Up</button>
+
+    <!-- Session leaderboard on waiting screen -->
+    <div class="session-lb-section" id="sessionLBWaitingWrap" style="display:none;">
+      <div class="session-lb-title">🏆 Session Leaderboard</div>
+      <div id="sessionLBWaiting"></div>
+    </div>
+  </div>
+
+  <!-- SPECTATOR SCREEN -->
+  <div id="screen-spectator" class="screen">
+    <div style="text-align: center; padding: 40px 0;">
+      <div style="font-size: 64px;">👀</div>
+      <div class="title mt-3" style="font-size: 24px;">Spectating</div>
+      <div class="subtitle mt-2">Watch the game on the big screen</div>
+    </div>
+    <div class="card">
+      <div id="spectatorLB"></div>
+    </div>
+  </div>
+
+  <!-- IMPOSTER GAME -->
+  <div id="screen-imposter" class="screen">
+    <div id="imposter-role-screen">
+      <div style="text-align: center; padding: 20px 0 10px;">
+        <div class="tag tag-purple">Round <span id="impRound">1</span></div>
+      </div>
+      <div class="card card-glow" style="text-align: center;">
+        <div id="impRoleDisplay"></div>
+        <div class="divider"></div>
+        <div class="subtitle" id="impInstruction"></div>
+      </div>
+      <div class="mt-4" id="emergencyWrap">
+        <button class="emergency-btn" id="emergencyBtn" onclick="callEmergency()">🚨 EMERGENCY</button>
+        <div class="subtitle text-center mt-2" id="emergencyStatus"></div>
+      </div>
+    </div>
+
+    <div id="imposter-voting-screen" style="display:none;">
+      <div style="text-align: center; padding: 10px 0;">
+        <div class="title" style="font-size: 20px; color: var(--danger);">🗳️ VOTE!</div>
+        <div class="subtitle mt-1">Who is the imposter?</div>
+        <div class="timer-bar mt-2"><div class="timer-bar-fill" id="voteTimerBar" style="width:100%"></div></div>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 12px;" id="votePlayerList"></div>
+      <div class="subtitle text-center mt-3" id="voteStatus"></div>
+    </div>
+  </div>
+
+  <!-- TRIVIAL GAME -->
+  <div id="screen-trivial" class="screen">
+    <div style="text-align: center; padding: 10px 0;">
+      <div class="tag tag-cyan">Round <span id="trivRound">1</span> / <span id="trivTotal">10</span></div>
+    </div>
+    <div class="card card-glow">
+      <div class="title" style="font-size: 20px; line-height: 1.4;" id="trivQuestion">Question loads...</div>
+      <div class="timer-bar mt-3"><div class="timer-bar-fill" id="trivTimerBar" style="width:100%"></div></div>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 12px;" id="trivOptions"></div>
+    <div class="card mt-3" id="trivResult" style="display:none; text-align:center;"></div>
+  </div>
+
+  <!-- REACTION GAME -->
+  <div id="screen-reaction" class="screen">
+    <div class="reaction-screen" id="reactionScreen" onclick="tapReaction()">
+      <div id="reactionContent" style="text-align: center; pointer-events: none;">
+        <div style="font-size: 40px;">⚫</div>
+        <div class="title mt-3" style="font-size: 28px; color: #fff;" id="reactionMsg">Get Ready...</div>
+        <div class="subtitle mt-2" style="color: rgba(255,255,255,0.5);" id="reactionSub">Tap when the screen flashes white!</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- WOULD YOU RATHER -->
+  <div id="screen-wouldyourather" class="screen">
+    <div style="text-align: center; padding: 10px 0;">
+      <div class="tag tag-gold">Round <span id="wyrRound">1</span> / <span id="wyrTotal">10</span></div>
+      <div class="title mt-2" style="font-size: 18px;">Would You Rather...</div>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 16px;">
+      <div class="wyr-opt a" id="wyrA" onclick="voteWYR(0)"></div>
+      <div style="text-align: center; color: var(--text2); font-weight: 700; font-size: 13px;">OR</div>
+      <div class="wyr-opt b" id="wyrB" onclick="voteWYR(1)"></div>
+    </div>
+    <div class="card mt-4" id="wyrResult" style="display:none; text-align:center;"></div>
+  </div>
+
+  <!-- MATH QUIZ -->
+  <div id="screen-mathquiz" class="screen">
+    <div style="text-align: center; padding: 10px 0;">
+      <div class="tag tag-purple">Round <span id="mathRound">1</span> / <span id="mathTotal">10</span></div>
+    </div>
+    <div class="card card-glow" style="text-align: center;">
+      <div style="font-size: 13px; color: var(--text2); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">Solve</div>
+      <div id="mathQuestion" style="font-family: var(--font-mono); font-size: 36px; font-weight: 700; color: var(--accent2);"></div>
+      <div class="timer-bar mt-3"><div class="timer-bar-fill" id="mathTimerBar" style="width:100%"></div></div>
+    </div>
+    <div class="grid-4 mt-3" id="mathOptions"></div>
+    <div class="card mt-3" id="mathResult" style="display:none; text-align:center;"></div>
+  </div>
+
+  <!-- FAST TYPER -->
+  <div id="screen-fasttyper" class="screen">
+    <div style="text-align: center; padding: 10px 0;">
+      <div class="tag tag-cyan">Round <span id="typeRound">1</span> / <span id="typeTotal">5</span></div>
+    </div>
+    <div class="card card-glow">
+      <div class="subtitle mb-2">Type this exactly:</div>
+      <div class="typing-prompt" id="typingPromptDisplay"></div>
+    </div>
+    <div class="mt-3">
+      <textarea class="typing-input" id="typingInput" placeholder="Start typing here..." rows="3" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+    </div>
+    <div class="flex gap-3 mt-3 items-center">
+      <div style="flex:1;">
+        <div class="progress-bar"><div class="progress-fill" id="typeProgress" style="width:0%"></div></div>
+      </div>
+      <div id="typeAccuracy" class="text-mono text-muted" style="font-size: 13px;">100%</div>
+    </div>
+    <div class="card mt-3" id="typeResult" style="display:none; text-align:center;"></div>
+  </div>
+
+  <!-- WORD CRACK -->
+  <div id="screen-wordcrack" class="screen">
+    <div style="text-align: center; padding: 10px 0;">
+      <div class="tag tag-green">Round <span id="wcRound">1</span> / <span id="wcTotal">5</span></div>
+    </div>
+    <div class="card card-glow">
+      <div class="subtitle mb-2">Guess the <span id="wcWordLen">5</span>-letter word</div>
+      <div id="wcGrid" class="wordle-grid"></div>
+      <div class="flex gap-2 mt-3">
+        <input class="input" id="wcInput" maxlength="10" placeholder="Type your guess..." autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false" style="flex:1; text-transform: uppercase;">
+        <button class="btn btn-primary" onclick="submitWordGuess()">Go</button>
+      </div>
+      <div id="wcMsg" class="subtitle text-center mt-2"></div>
+    </div>
+    <div class="card mt-3" id="wcResult" style="display:none; text-align:center;"></div>
+  </div>
+
+  <!-- CODE BREAKER -->
+  <div id="screen-codebreaker" class="screen">
+    <div style="text-align: center; padding: 10px 0;">
+      <div class="tag tag-purple">Round <span id="cbRound">1</span> / <span id="cbTotal">5</span></div>
+    </div>
+    <div class="card card-glow">
+      <div class="subtitle mb-2">Crack the 4-digit code</div>
+      <div id="cbGrid" class="wordle-grid" style="--cell-size: 52px;"></div>
+      <div class="number-pad mt-3" id="cbNumPad"></div>
+      <div class="code-display mt-3" id="cbCurrentDisplay">
+        <div class="code-dot" id="cb0">_</div>
+        <div class="code-dot" id="cb1">_</div>
+        <div class="code-dot" id="cb2">_</div>
+        <div class="code-dot" id="cb3">_</div>
+      </div>
+      <button class="btn btn-primary btn-block mt-2" onclick="submitCodeGuess()">Submit</button>
+      <div id="cbMsg" class="subtitle text-center mt-2"></div>
+    </div>
+    <div class="card mt-3" id="cbResult" style="display:none; text-align:center;"></div>
+  </div>
+
+  <!-- ROULETTE -->
+  <div id="screen-roulette" class="screen">
+    <div style="text-align: center; padding: 10px 0;">
+      <div class="tag tag-red">🎰 Russian Roulette</div>
+    </div>
+    <div class="card card-glow" style="text-align: center;">
+      <div class="roulette-gun" id="rouletteGun">🔫</div>
+      <div class="roulette-chambers" id="rouletteChambers">
+        <div class="chamber">○</div><div class="chamber">○</div>
+        <div class="chamber loaded">●</div><div class="chamber">○</div>
+        <div class="chamber">○</div><div class="chamber">○</div>
+      </div>
+      <div class="title mt-2" id="rouletteMsg">Waiting for your turn...</div>
+      <div class="subtitle mt-1" id="rouletteSub"></div>
+    </div>
+    <div id="rouletteControls" style="display:none; margin-top: 16px;">
+      <div class="flex gap-3">
+        <button class="btn btn-secondary btn-block" onclick="playerSpin()">🔄 Spin</button>
+        <button class="btn btn-danger btn-block" onclick="playerShoot()">💥 Shoot</button>
+      </div>
+    </div>
+    <div class="card mt-3" id="rouletteResult" style="display:none; text-align:center;"></div>
+  </div>
+
+  <!-- RAPID FIRE -->
+  <div id="screen-rapidfire" class="screen">
+    <div style="text-align: center; padding: 10px 0;">
+      <div class="tag tag-gold">⚡ Rapid Fire</div>
+      <div class="timer-bar mt-2"><div class="timer-bar-fill" id="rfTimerBar" style="width:100%"></div></div>
+    </div>
+    <div class="card card-glow mt-2">
+      <div class="title" style="font-size: 18px; line-height: 1.4;" id="rfQuestion">Get ready...</div>
+    </div>
+    <div class="grid-4 mt-3" id="rfOptions"></div>
+    <div class="card mt-3" id="rfFeedback" style="display:none; text-align:center;"></div>
+  </div>
+
+  <!-- GAME OVER -->
+  <div id="screen-gameover" class="screen">
+    <div style="text-align: center; padding: 20px 0;">
+      <div style="font-size: 48px;">🏆</div>
+      <div class="title mt-2" style="font-size: 28px;">Game Over!</div>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 8px;" id="finalLeaderboard"></div>
+
+    <!-- Session leaderboard on game over screen -->
+    <div class="session-lb-section mt-4">
+      <div class="session-lb-title">🏆 Session Leaderboard</div>
+      <div id="sessionLBGameOver">
+        <div style="color:var(--text2); font-size:13px;">No games yet</div>
+      </div>
+    </div>
+
+    <button class="btn btn-primary btn-block mt-4" onclick="backToWaiting()">Back to Lobby</button>
+  </div>
+
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/js/player.js"></script>
+</body>
+</html>

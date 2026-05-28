@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Game Night — Display</title>
+  <link rel="stylesheet" href="/css/main.css">
+  <style>
+    body { overflow: hidden; height: 100vh; }
+    #display { width: 100vw; height: 100vh; display: flex; flex-direction: column; position: relative; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; padding: 20px 32px; background: rgba(15,15,26,0.8); border-bottom: 1px solid var(--border); backdrop-filter: blur(10px); z-index: 10; }
+    .logo-lg { font-family: var(--font-display); font-size: 28px; font-weight: 700; letter-spacing: 3px; }
+    .logo-lg span { color: var(--accent); }
+    .game-label { font-family: var(--font-display); font-size: 18px; font-weight: 600; color: var(--text2); letter-spacing: 1px; }
+    .content { flex: 1; display: flex; overflow: hidden; }
+    .main-display { flex: 1; display: flex; align-items: center; justify-content: center; padding: 32px; }
+    .right-panel { width: 320px; background: var(--surface); border-left: 1px solid var(--border); padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+    .panel-title { font-family: var(--font-display); font-size: 16px; font-weight: 700; letter-spacing: 1px; color: var(--text2); text-transform: uppercase; margin-bottom: 4px; }
+    .lb-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px; background: var(--surface2); border: 1px solid var(--border); transition: all 0.4s; }
+    .lb-row.rank-1 { background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.3); }
+    .lb-row.rank-2 { border-color: rgba(156,163,175,0.3); }
+    .lb-row.rank-3 { background: rgba(180,83,9,0.08); border-color: rgba(180,83,9,0.3); }
+    .lb-rank { font-family: var(--font-mono); font-size: 18px; font-weight: 700; width: 30px; text-align: center; }
+    .rank-1 .lb-rank { color: var(--accent3); }
+    .rank-2 .lb-rank { color: #9ca3af; }
+    .rank-3 .lb-rank { color: #b45309; }
+    .lb-name { flex: 1; font-weight: 600; font-size: 14px; }
+    .lb-score { font-family: var(--font-mono); font-size: 15px; font-weight: 700; color: var(--accent3); }
+    .lb-elim { font-size: 11px; color: var(--danger); font-weight: 600; }
+    .center-card { background: var(--surface); border: 1px solid var(--border); border-radius: 24px; padding: 48px; width: 100%; max-width: 900px; box-shadow: 0 0 80px rgba(124,58,237,0.1); }
+    .big-title { font-family: var(--font-display); font-size: 64px; font-weight: 700; letter-spacing: 4px; text-align: center; }
+    .join-info { text-align: center; margin-top: 24px; }
+    .join-code { font-family: var(--font-mono); font-size: 80px; font-weight: 700; color: var(--accent2); letter-spacing: 16px; text-shadow: 0 0 40px rgba(6,182,212,0.5); }
+    .join-url { font-family: var(--font-mono); font-size: 20px; color: var(--text2); margin-top: 12px; }
+    #qrDisplay { margin-top: 16px; }
+    #qrDisplay img { border-radius: 16px; border: 4px solid var(--surface2); }
+    .players-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; width: 100%; }
+    .player-bubble { background: var(--surface2); border: 1px solid var(--border); border-radius: 16px; padding: 16px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 8px; transition: all 0.3s; }
+    .player-bubble .avatar { width: 56px; height: 56px; font-size: 24px; }
+    .player-bubble .pname { font-weight: 700; font-size: 14px; }
+    .player-bubble.ready { border-color: var(--success); background: rgba(16,185,129,0.1); }
+    .player-bubble.eliminated { opacity: 0.35; filter: grayscale(1); }
+    .flash-screen { position: fixed; inset: 0; background: #fff; z-index: 100; display: none; }
+    .flash-screen.active { display: block; }
+    .reaction-dark { position: fixed; inset: 0; background: #000; z-index: 99; display: none; flex-direction: column; align-items: center; justify-content: center; }
+    .reaction-dark.active { display: flex; }
+    .reaction-big-text { font-family: var(--font-display); font-size: 80px; font-weight: 700; color: #fff; letter-spacing: 4px; }
+    .vote-board { display: flex; flex-direction: column; gap: 12px; width: 100%; }
+    .vote-row { display: flex; align-items: center; gap: 12px; padding: 16px 20px; background: var(--surface2); border-radius: 14px; border: 1px solid var(--border); }
+    .vote-name { flex: 1; font-weight: 700; font-size: 18px; }
+    .vote-bar-wrap { width: 200px; }
+    .vote-count { font-family: var(--font-mono); font-size: 20px; font-weight: 700; color: var(--accent3); width: 40px; text-align: right; }
+    .vote-indicator { display: flex; gap: 6px; margin-left: 8px; }
+    .vote-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); }
+    .typing-progress-grid { display: flex; flex-direction: column; gap: 10px; width: 100%; }
+    .typing-progress-row { display: flex; align-items: center; gap: 12px; }
+    .typing-progress-name { width: 140px; font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .typing-bar-wrap { flex: 1; }
+    .typing-time { font-family: var(--font-mono); font-size: 13px; color: var(--accent3); width: 60px; text-align: right; }
+    .wordle-mini { display: grid; gap: 3px; }
+    .wordle-mini .wm-cell { width: 28px; height: 28px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface2); display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); font-size: 11px; font-weight: 700; }
+    .wordle-mini .wm-cell.correct { background: var(--success); border-color: var(--success); color: #fff; }
+    .wordle-mini .wm-cell.present { background: var(--accent3); border-color: var(--accent3); color: #fff; }
+    .wordle-mini .wm-cell.absent { background: #374151; border-color: #374151; }
+    .grid-players { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; width: 100%; }
+    .grid-player-card { background: var(--surface2); border-radius: 12px; border: 1px solid var(--border); padding: 12px; }
+    .grid-player-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-weight: 700; font-size: 13px; }
+    .answer-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--success); }
+    .answer-dot.waiting { background: var(--border); }
+    .answer-dot.answered { background: var(--accent2); animation: pulse 1s infinite; }
+    .roulette-display { text-align: center; }
+    .roulette-big { font-size: 100px; margin-bottom: 16px; }
+    .roulette-turn { font-family: var(--font-display); font-size: 40px; font-weight: 700; }
+    .countdown { font-family: var(--font-mono); font-size: 120px; font-weight: 700; color: var(--accent); text-shadow: 0 0 40px rgba(124,58,237,0.6); animation: scaleIn 0.3s; }
+    .wyr-split { display: flex; gap: 24px; width: 100%; }
+    .wyr-side { flex: 1; padding: 32px; border-radius: 20px; text-align: center; font-size: 22px; font-weight: 600; }
+    .wyr-side.a { background: rgba(124,58,237,0.15); border: 2px solid rgba(124,58,237,0.3); }
+    .wyr-side.b { background: rgba(6,182,212,0.15); border: 2px solid rgba(6,182,212,0.3); }
+    .wyr-pct { font-family: var(--font-mono); font-size: 48px; font-weight: 700; margin-top: 12px; }
+    .wyr-names { font-size: 13px; color: var(--text2); margin-top: 8px; }
+    .answer-status-grid { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; }
+    .answer-chip { padding: 8px 14px; border-radius: 8px; background: var(--surface2); border: 1px solid var(--border); font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+    .answer-chip.done { border-color: var(--accent2); background: rgba(6,182,212,0.1); }
+    .game-over-screen { text-align: center; width: 100%; }
+    .winner-name { font-family: var(--font-display); font-size: 56px; font-weight: 700; color: var(--accent3); text-shadow: 0 0 40px rgba(245,158,11,0.5); }
+    .confetti { position: fixed; inset: 0; pointer-events: none; z-index: 200; }
+    .rapidfire-live { width: 100%; }
+    .rf-question-big { font-family: var(--font-display); font-size: 36px; font-weight: 700; text-align: center; margin-bottom: 24px; line-height: 1.3; }
+    .rf-options-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .rf-opt { padding: 16px 24px; border-radius: 12px; font-size: 18px; font-weight: 600; text-align: center; border: 2px solid var(--border); background: var(--surface2); }
+    .rf-opt.a { border-color: rgba(124,58,237,0.4); }
+    .rf-opt.b { border-color: rgba(6,182,212,0.4); }
+    .rf-opt.c { border-color: rgba(245,158,11,0.4); }
+    .rf-opt.d { border-color: rgba(239,68,68,0.4); }
+  </style>
+</head>
+<body>
+<div class="noise"></div>
+<div id="display">
+  <div class="topbar">
+    <div class="logo-lg">GAME<span>NIGHT</span></div>
+    <div class="game-label" id="topGameLabel">Waiting for host...</div>
+    <div style="display:flex; align-items:center; gap:12px;">
+      <div id="topRound" class="tag tag-purple" style="display:none;">Round 1</div>
+      <div class="tag tag-green">🟢 LIVE</div>
+    </div>
+  </div>
+
+  <div class="content">
+    <div class="main-display" id="mainDisplay">
+
+      <!-- LOBBY -->
+      <div id="view-lobby" style="width:100%; max-width:900px; text-align:center;">
+        <div class="big-title">GAME<span style="color:var(--accent)">NIGHT</span></div>
+        <div style="color:var(--text2); font-size:20px; margin-top:8px;">Local party games — no internet needed</div>
+        <div class="join-info">
+          <div style="font-size:16px; color:var(--text2); margin-bottom:8px;">JOIN AT</div>
+          <div class="join-url" id="displayUrl">Loading...</div>
+          <div class="join-code" id="displayCode">----</div>
+          <div id="qrDisplay"><img id="qrImg" width="200" height="200" alt="QR"></div>
+        </div>
+        <div style="margin-top:32px;">
+          <div style="font-size:16px; font-weight:700; color:var(--text2); margin-bottom:16px;">Players Joined</div>
+          <div class="players-grid" id="lobbyPlayersGrid"></div>
+        </div>
+      </div>
+
+      <!-- COUNTDOWN -->
+      <div id="view-countdown" style="display:none; text-align:center;">
+        <div style="font-size:20px; color:var(--text2); margin-bottom:16px;">STARTING IN</div>
+        <div class="countdown" id="countdownNum">3</div>
+      </div>
+
+      <!-- IMPOSTER -->
+      <div id="view-imposter" style="display:none; width:100%;">
+        <div style="text-align:center; margin-bottom:24px;">
+          <div class="big-title" style="font-size:40px;">🕵️ WHO IS THE IMPOSTER?</div>
+          <div style="color:var(--text2); margin-top:8px; font-size:18px;" id="impDisplayMsg">Players are reading their roles...</div>
+        </div>
+        <div id="impWordDisplay" class="players-grid"></div>
+      </div>
+
+      <!-- IMPOSTER VOTING -->
+      <div id="view-imposter-voting" style="display:none; width:100%;">
+        <div style="text-align:center; margin-bottom:24px;">
+          <div class="big-title" style="font-size:40px; color:var(--danger);">🗳️ EMERGENCY VOTE!</div>
+          <div class="timer-bar mt-2" style="max-width:600px; margin:12px auto 0;"><div class="timer-bar-fill" id="displayVoteTimer" style="width:100%"></div></div>
+        </div>
+        <div class="vote-board" id="displayVoteBoard" style="max-width:700px; margin:0 auto;"></div>
+        <div style="text-align:center; margin-top:16px; color:var(--text2);" id="displayVoteProgress"></div>
+      </div>
+
+      <!-- TRIVIAL -->
+      <div id="view-trivial" style="display:none; width:100%; max-width:800px;">
+        <div class="center-card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+            <div class="tag tag-cyan" id="trivDisplayRound">Round 1/10</div>
+            <div class="timer-bar" style="width:200px;"><div class="timer-bar-fill" id="trivDisplayTimer" style="width:100%"></div></div>
+          </div>
+          <div style="font-size:28px; font-weight:700; line-height:1.4; margin-bottom:24px;" id="trivDisplayQ"></div>
+          <div class="grid-4" id="trivDisplayOpts" style="gap:12px;"></div>
+        </div>
+        <div class="answer-status-grid mt-4" id="trivAnswerStatus"></div>
+      </div>
+
+      <!-- REACTION -->
+      <div id="view-reaction-dark" class="reaction-dark" style="position:relative; width:100%; height:100%; background:#000; display:none; align-items:center; justify-content:center; border-radius:0;">
+        <div style="text-align:center;">
+          <div class="reaction-big-text" id="reactionDisplayText">GET READY</div>
+          <div style="color:rgba(255,255,255,0.4); font-size:24px; margin-top:16px;" id="reactionDisplaySub">Watch the screen and tap on your phone!</div>
+        </div>
+      </div>
+
+      <!-- WYR -->
+      <div id="view-wyr" style="display:none; width:100%; max-width:900px;">
+        <div style="text-align:center; margin-bottom:24px;">
+          <div class="big-title" style="font-size:36px;">🤔 WOULD YOU RATHER...</div>
+          <div class="tag tag-gold mt-2" id="wyrDisplayRound">Round 1/10</div>
+        </div>
+        <div class="wyr-split" id="wyrDisplaySplit"></div>
+        <div style="text-align:center; margin-top:16px; color:var(--text2);" id="wyrDisplayProgress"></div>
+      </div>
+
+      <!-- MATH -->
+      <div id="view-math" style="display:none; width:100%; max-width:700px;">
+        <div class="center-card" style="text-align:center;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+            <div class="tag tag-purple" id="mathDisplayRound">Round 1/10</div>
+            <div class="timer-bar" style="width:200px;"><div class="timer-bar-fill" id="mathDisplayTimer" style="width:100%"></div></div>
+          </div>
+          <div style="font-size:16px; color:var(--text2); margin-bottom:8px;">Solve</div>
+          <div style="font-family:var(--font-mono); font-size:72px; font-weight:700; color:var(--accent2);" id="mathDisplayQ"></div>
+        </div>
+        <div class="answer-status-grid mt-4" id="mathAnswerStatus"></div>
+      </div>
+
+      <!-- FAST TYPER -->
+      <div id="view-fasttyper" style="display:none; width:100%; max-width:900px;">
+        <div class="center-card">
+          <div class="tag tag-cyan mb-3" id="typeDisplayRound">Round 1/5</div>
+          <div style="font-family:var(--font-mono); font-size:22px; color:var(--accent2); margin-bottom:24px; line-height:1.6;" id="typeDisplayPrompt"></div>
+          <div class="typing-progress-grid" id="typeDisplayProgress"></div>
+        </div>
+      </div>
+
+      <!-- WORD CRACK -->
+      <div id="view-wordcrack" style="display:none; width:100%;">
+        <div style="text-align:center; margin-bottom:16px;">
+          <div class="big-title" style="font-size:36px;">🟩 WORD CRACK</div>
+          <div class="tag tag-green mt-2" id="wcDisplayRound">Round 1/5</div>
+          <div style="color:var(--text2); margin-top:8px; font-size:16px;" id="wcDisplayMsg">Find the hidden word!</div>
+        </div>
+        <div class="grid-players" id="wcDisplayGrid"></div>
+      </div>
+
+      <!-- CODE BREAKER -->
+      <div id="view-codebreaker" style="display:none; width:100%;">
+        <div style="text-align:center; margin-bottom:16px;">
+          <div class="big-title" style="font-size:36px;">🔐 CODE BREAKER</div>
+          <div class="tag tag-purple mt-2" id="cbDisplayRound">Round 1/5</div>
+          <div style="color:var(--text2); margin-top:8px;" id="cbDisplayMsg">Crack the 4-digit code!</div>
+        </div>
+        <div class="grid-players" id="cbDisplayGrid"></div>
+      </div>
+
+      <!-- ROULETTE -->
+      <div id="view-roulette" style="display:none; width:100%; max-width:700px; text-align:center;">
+        <div class="roulette-display">
+          <div class="roulette-big" id="rouletteDisplayGun">🔫</div>
+          <div class="roulette-turn" id="rouletteDisplayTurn">Waiting...</div>
+          <div style="color:var(--text2); margin-top:8px; font-size:18px;" id="rouletteDisplaySub"></div>
+          <div style="display:flex; gap:8px; justify-content:center; margin-top:20px;" id="rouletteDisplayChambers"></div>
+          <div style="margin-top:24px; display:flex; flex-wrap:wrap; gap:8px; justify-content:center;" id="rouletteDisplayPlayers"></div>
+        </div>
+      </div>
+
+      <!-- RAPID FIRE -->
+      <div id="view-rapidfire" style="display:none; width:100%; max-width:800px;">
+        <div style="margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
+          <div class="tag tag-gold">⚡ RAPID FIRE</div>
+          <div class="timer-bar" style="width:300px;"><div class="timer-bar-fill" id="rfDisplayTimer" style="width:100%"></div></div>
+        </div>
+        <div class="center-card">
+          <div class="rf-question-big" id="rfDisplayQ"></div>
+          <div class="rf-options-grid" id="rfDisplayOpts"></div>
+        </div>
+      </div>
+
+      <!-- GAME OVER -->
+      <div id="view-gameover" style="display:none; width:100%; max-width:700px; text-align:center;">
+        <div style="font-size:32px; color:var(--text2); margin-bottom:8px;">Game Over!</div>
+        <div class="winner-name" id="winnerDisplayName"></div>
+        <div style="font-size:20px; color:var(--text2); margin-top:8px;">wins the round! 🏆</div>
+        <div style="display:flex; flex-direction:column; gap:8px; margin-top:24px;" id="gameoverLB"></div>
+      </div>
+
+    </div>
+
+    <!-- RIGHT LEADERBOARD PANEL -->
+    <div class="right-panel">
+      <div class="panel-title">Leaderboard</div>
+      <div style="display:flex; flex-direction:column; gap:8px;" id="displayLeaderboard"></div>
+    </div>
+  </div>
+</div>
+
+<div class="flash-screen" id="flashScreen"></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/js/display.js"></script>
+</body>
+</html>
