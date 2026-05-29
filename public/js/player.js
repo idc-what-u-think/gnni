@@ -4,6 +4,7 @@ let myId = null;
 let myName = "";
 let myAvatar = null;
 let roomCode = "";
+let myReconnectToken = null;
 let currentGame = "";
 let hasEmergency = true;
 let hasVoted = false;
@@ -136,34 +137,91 @@ $("joinBtn").onclick = () => {
   socket.emit("player_join", { code, name, avatar: myAvatar });
 };
 
-socket.on("joined", ({ player, code }) => {
+// ─── AUTO-RECONNECT ON LOAD ─────────────────────────────────────────
+window.addEventListener("load", () => {
+  const token = localStorage.getItem("gn_token");
+  const code  = localStorage.getItem("gn_code");
+  const name  = localStorage.getItem("gn_name");
+  const avatar = localStorage.getItem("gn_avatar");
+  if (token && code && name) {
+    myName = name;
+    myAvatar = avatar || null;
+    roomCode = code;
+    // Pre-fill the join form in case reconnect fails
+    const nameInput = $("nameInput");
+    if (nameInput) nameInput.value = name;
+    codeChars = code.split("");
+    updateCodeDisplay();
+    socket.emit("player_join", { code, name, avatar, reconnectToken: token });
+  }
+});
+
+socket.on("joined", ({ player, code, reconnectToken }) => {
   myId = player.id;
+  myName = player.name;
   roomCode = code;
+  if (reconnectToken) {
+    myReconnectToken = reconnectToken;
+    localStorage.setItem("gn_token",  reconnectToken);
+    localStorage.setItem("gn_code",   code);
+    localStorage.setItem("gn_name",   player.name);
+    localStorage.setItem("gn_avatar", player.avatar || "");
+  }
   showScreen("waiting");
   $("waitRoomCode").textContent = `Room: ${code}`;
 });
 
 socket.on("error", ({ msg }) => {
+  // If room is gone, wipe stale session so the player lands on join screen cleanly
+  if (msg === "Room not found") {
+    localStorage.removeItem("gn_token");
+    localStorage.removeItem("gn_code");
+    localStorage.removeItem("gn_name");
+    localStorage.removeItem("gn_avatar");
+    myReconnectToken = null;
+  }
   $("joinError").textContent = msg;
   showSnackbar(msg, "error");
 });
 
 socket.on("kicked", () => {
+  localStorage.removeItem("gn_token");
+  localStorage.removeItem("gn_code");
+  localStorage.removeItem("gn_name");
+  localStorage.removeItem("gn_avatar");
+  myReconnectToken = null;
   showScreen("join");
   showSnackbar("You were kicked by the host", "error");
 });
 
 socket.on("room_state", ({ players, phase }) => {
-  if (phase === "lobby" || phase === "settings") {
-    $("waitPlayerCount").textContent = players.length;
+  if (phase === "lobby" || phase === "settings" || phase === "ended") {
+    $("waitPlayerCount").textContent = players.filter(p => !p.disconnected).length;
     $("waitPlayerList").innerHTML = players.map(p => `
-      <div class="player-row">
+      <div class="player-row" style="${p.disconnected ? "opacity:0.45;" : ""}">
         ${makeAvatarEl(p)}
-        <span class="player-name">${p.name}${p.id === myId ? " (You)" : ""}</span>
-        ${p.ready ? '<span class="tag tag-green">Ready</span>' : '<span class="tag">Waiting</span>'}
+        <span class="player-name">
+          ${p.name}${p.id === myId ? " (You)" : ""}
+          ${p.disconnected ? " 🔴" : ""}
+        </span>
+        ${p.disconnected
+          ? '<span class="tag">Reconnecting...</span>'
+          : p.ready
+            ? '<span class="tag tag-green">Ready</span>'
+            : '<span class="tag">Waiting</span>'
+        }
       </div>
     `).join("");
   }
+  // Mid-game kick / disconnect visibility
+  if (phase === "playing") {
+    const kicked = players.filter(p => p.disconnected || p.eliminated).map(p => p.name);
+    if (kicked.length) showSnackbar(`Disconnected: ${kicked.join(", ")}`);
+  }
+});
+
+socket.on("player_reconnected", ({ name }) => {
+  showSnackbar(`${name} reconnected! 🟢`);
 });
 
 function toggleReady() {
@@ -451,11 +509,12 @@ socket.on("wyr_vote_received", ({ total }) => {
 });
 
 socket.on("wyr_reveal", ({ aVotes, bVotes, minority }) => {
-  // Correctly detect which button the player clicked
   const myVote = wyrVoted
     ? ($("wyrA").classList.contains("selected") ? 0 : 1)
     : null;
-  const lost = myVote !== null && myVote === minority;
+  const tie = minority === -1;
+  const lost = !tie && myVote !== null && myVote === minority;
+  const won  = !tie && myVote !== null && myVote !== minority;
   const didNotVote = myVote === null;
   $("wyrResult").style.display = "block";
   $("wyrResult").innerHTML = `
@@ -463,9 +522,11 @@ socket.on("wyr_reveal", ({ aVotes, bVotes, minority }) => {
     <div style="font-size:20px; font-weight:700; margin-top:6px;">🅰️ ${aVotes} vs 🅱️ ${bVotes}</div>
     ${didNotVote
       ? '<div class="text-muted mt-2">You didn\'t vote in time</div>'
-      : lost
-        ? '<div class="text-danger mt-2">You were in the minority! -10 points</div>'
-        : '<div class="text-success mt-2">You were in the majority! ✅</div>'
+      : tie
+        ? '<div class="text-muted mt-2">It\'s a tie! No points change.</div>'
+        : lost
+          ? '<div class="text-danger mt-2">You were in the minority! -10 points</div>'
+          : '<div class="text-success mt-2">You were in the majority! +20 points ✅</div>'
     }
   `;
 });
@@ -749,6 +810,9 @@ socket.on("your_turn", ({ game }) => {
   $("rouletteSub").textContent = "Spin or shoot?";
   $("rouletteControls").style.display = "block";
   $("rouletteControls").classList.add("your-turn-glow");
+  // Restore spin button for this new turn
+  const spinBtn = document.getElementById("spinBtn");
+  if (spinBtn) spinBtn.style.display = "";
 });
 
 socket.on("roulette_next", ({ currentPlayer, name }) => {
@@ -772,6 +836,13 @@ socket.on("roulette_spin_done", () => {
   $("rouletteMsg").textContent = "Chamber spun!";
   $("rouletteSub").textContent = "Now shoot!";
   $("rouletteControls").style.display = "block";
+  // Hide spin button after use — one spin per turn
+  const spinBtn = document.getElementById("spinBtn");
+  if (spinBtn) spinBtn.style.display = "none";
+});
+
+socket.on("roulette_spin_denied", ({ msg }) => {
+  showSnackbar(msg, "error");
 });
 
 socket.on("roulette_spin", ({ playerId }) => {
@@ -893,6 +964,8 @@ socket.on("session_leaderboard", ({ leaderboard }) => {
 function backToWaiting() {
   showScreen("waiting");
   requestSessionLB();
+  // Re-sync player list (phase may be "ended" — server handles that now)
+  socket.emit("request_room_state", { code: roomCode });
 }
 
 socket.on("show_leaderboard", ({ players }) => {
