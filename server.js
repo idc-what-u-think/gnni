@@ -127,7 +127,8 @@ function getRoomState(room) {
   return {
     players: room.players.map(p => ({
       id: p.id, name: p.name, avatar: p.avatar,
-      score: p.score, lives: p.lives, eliminated: p.eliminated, ready: p.ready
+      score: p.score, lives: p.lives, eliminated: p.eliminated,
+      ready: p.ready, disconnected: p.disconnected || false
     })),
     game: room.game,
     gameState: room.gameState,
@@ -332,21 +333,52 @@ io.on("connection", (socket) => {
     socket.emit("room_state", getRoomState(room));
   });
 
-  socket.on("player_join", ({ code, name, avatar }) => {
+  socket.on("player_join", ({ code, name, avatar, reconnectToken }) => {
     const room = getRoom(code);
     if (!room) return socket.emit("error", { msg: "Room not found" });
-    if (room.players.length >= 15) return socket.emit("error", { msg: "Room is full" });
 
-    const existing = room.players.find(p => p.name.toLowerCase() === name.toLowerCase());
+    // ── RECONNECT PATH ──────────────────────────────────────────────
+    if (reconnectToken) {
+      const ghost = room.players.find(p => p.reconnectToken === reconnectToken);
+      if (ghost) {
+        if (ghost._disconnectTimer) {
+          clearTimeout(ghost._disconnectTimer);
+          ghost._disconnectTimer = null;
+        }
+        ghost.id = socket.id;
+        ghost.disconnected = false;
+        socket.join(code);
+        socket.data.roomCode = code;
+        socket.emit("joined", { player: ghost, code, reconnectToken: ghost.reconnectToken });
+        socket.emit("session_leaderboard", { leaderboard: getSessionLeaderboard() });
+        broadcastRoom(code, "player_reconnected", { id: ghost.id, name: ghost.name });
+        broadcastRoom(code, "room_state", getRoomState(room));
+        if (room.phase === "playing" && room.game) {
+          socket.emit("game_start", { game: room.game, settings: room.settings });
+        }
+        return;
+      }
+      // Token not found — fall through to fresh join
+    }
+
+    // ── FRESH JOIN PATH ─────────────────────────────────────────────
+    if (room.players.length >= 15) return socket.emit("error", { msg: "Room is full" });
+    const existing = room.players.find(
+      p => p.name.toLowerCase() === name.toLowerCase() && !p.disconnected
+    );
     if (existing) return socket.emit("error", { msg: "Name already taken" });
 
-    const player = { id: socket.id, name, avatar: avatar || null, score: 0, lives: 3, eliminated: false, ready: false };
+    const token = crypto.randomUUID();
+    const player = {
+      id: socket.id, name, avatar: avatar || null,
+      score: 0, lives: 3, eliminated: false, ready: false,
+      disconnected: false, reconnectToken: token, _disconnectTimer: null
+    };
     room.players.push(player);
     socket.join(code);
     socket.data.roomCode = code;
-    socket.emit("joined", { player, code });
+    socket.emit("joined", { player, code, reconnectToken: token });
     broadcastRoom(code, "room_state", getRoomState(room));
-    // Send session leaderboard to new player
     socket.emit("session_leaderboard", { leaderboard: getSessionLeaderboard() });
   });
 
@@ -360,6 +392,12 @@ io.on("connection", (socket) => {
   socket.on("host_kick", ({ code, playerId }) => {
     const room = getRoom(code);
     if (!room) return;
+    const kicked = room.players.find(p => p.id === playerId);
+    if (kicked) {
+      if (kicked._disconnectTimer) clearTimeout(kicked._disconnectTimer);
+      // Invalidate token so they cannot reconnect
+      kicked.reconnectToken = null;
+    }
     room.players = room.players.filter(p => p.id !== playerId);
     io.to(playerId).emit("kicked");
     broadcastRoom(code, "room_state", getRoomState(room));
@@ -409,6 +447,14 @@ io.on("connection", (socket) => {
     endGame(code);
   });
 
+  socket.on("host_reset_session_leaderboard", ({ code }) => {
+    const room = getRoom(code);
+    if (!room) return;
+    // Clear all session leaderboard entries
+    Object.keys(sessionLeaderboard).forEach(k => delete sessionLeaderboard[k]);
+    broadcastRoom(code, "session_leaderboard", { leaderboard: [] });
+  });
+
   socket.on("player_answer", ({ code, answer, time }) => {
     const room = getRoom(code);
     if (!room) return;
@@ -443,7 +489,7 @@ io.on("connection", (socket) => {
     broadcastRoom(code, "vote_cast", {
       voterId: socket.id,
       totalVotes: Object.keys(room.gameState.votes).length,
-      totalVoters: room.players.filter(p => !p.eliminated).length
+      totalVoters: room.players.filter(p => !p.eliminated && !p.disconnected).length
     });
   });
 
@@ -469,12 +515,31 @@ io.on("connection", (socket) => {
     socket.emit("session_leaderboard", { leaderboard: getSessionLeaderboard() });
   });
 
+  socket.on("request_room_state", ({ code }) => {
+    const room = getRoom(code);
+    if (!room) return;
+    socket.emit("room_state", getRoomState(room));
+  });
+
   socket.on("disconnect", () => {
     const code = socket.data.roomCode;
     if (!code) return;
     const room = getRoom(code);
     if (!room) return;
-    broadcastRoom(code, "player_disconnected", { id: socket.id });
+    const player = room.players.find(p => p.id === socket.id);
+    if (!player) return;
+
+    // Mark as disconnected, start 60s grace window before full removal
+    player.disconnected = true;
+    broadcastRoom(code, "player_disconnected", { id: socket.id, name: player.name });
+    broadcastRoom(code, "room_state", getRoomState(room));
+
+    player._disconnectTimer = setTimeout(() => {
+      const r = getRoom(code);
+      if (!r) return;
+      r.players = r.players.filter(p => p.reconnectToken !== player.reconnectToken);
+      broadcastRoom(code, "room_state", getRoomState(r));
+    }, 60000);
   });
 });
 
@@ -663,6 +728,10 @@ function triggerFlash(code) {
     const totalRounds = room.settings.rounds || 5;
 
     if (remaining.length <= 1 || room.round >= totalRounds) {
+      // Award winner points in laststanding mode
+      if (room.settings.mode !== "mosttaps" && remaining.length === 1) {
+        remaining[0].score += 100 * room.round;
+      }
       setTimeout(() => endGame(code), 3000);
     } else {
       setTimeout(() => { room.round++; startRound(code); }, 3000);
@@ -703,7 +772,13 @@ function revealWYR(code) {
 
   const minority = aVotes < bVotes ? 0 : bVotes < aVotes ? 1 : -1;
   room.players.forEach(p => {
-    if (votes[p.id] === minority) p.score -= 10;
+    if (!votes.hasOwnProperty(p.id)) return; // didn't vote — no change
+    if (minority === -1) return;              // tie — no penalty/reward
+    if (votes[p.id] === minority) {
+      p.score -= 10; // minority loses
+    } else {
+      p.score += 20; // majority wins
+    }
   });
 
   broadcastRoom(code, "wyr_reveal", {
@@ -812,7 +887,7 @@ function handleTypingDone(code, playerId, time, accuracy) {
     players: getSortedPlayers(room)
   });
 
-  const activePlayers = room.players.filter(p => !p.eliminated);
+  const activePlayers = room.players.filter(p => !p.eliminated && !p.disconnected);
   if (Object.keys(room.gameState.finished).length >= activePlayers.length) {
     clearTimeout(room.timers.typingTimeout);
     setTimeout(() => {
@@ -947,7 +1022,7 @@ function startRouletteRound(code) {
   const room = getRoom(code);
   const activePlayers = room.players.filter(p => !p.eliminated);
   const order = shuffle(activePlayers.map(p => p.id));
-  room.gameState = { chamber: Math.floor(Math.random() * 6), currentShot: 0, order, currentIdx: 0 };
+  room.gameState = { chamber: Math.floor(Math.random() * 6), currentShot: 0, order, currentIdx: 0, spinsUsed: {} };
   room.phase = "playing";
 
   broadcastRoom(code, "roulette_round", {
@@ -966,6 +1041,11 @@ function handleRoulette(code, playerId, spin) {
   if (gs.order[gs.currentIdx] !== playerId) return;
 
   if (spin) {
+    if (gs.spinsUsed[playerId]) {
+      io.to(playerId).emit("roulette_spin_denied", { msg: "You already spun this turn" });
+      return;
+    }
+    gs.spinsUsed[playerId] = true;
     gs.chamber = Math.floor(Math.random() * 6);
     gs.currentShot = 0;
     broadcastRoom(code, "roulette_spin", { playerId });
@@ -1017,9 +1097,10 @@ function startRapidFireRound(code) {
   const duration = (room.settings.duration || 60) * 1000;
   room.gameState = { questions: shuffle([...RAPID_FIRE]), currentQ: 0, answers: {}, startTime: Date.now() };
 
+  const firstQ = room.gameState.questions[0];
   broadcastRoom(code, "rapidfire_start", {
     duration,
-    question: room.gameState.questions[0]
+    question: { q: firstQ.q, options: firstQ.options }
   });
 
   room.timers.rapidfire = setTimeout(() => endRapidFire(code), duration);
@@ -1035,7 +1116,8 @@ function nextRapidFireQuestion(code) {
     room.gameState.questions = shuffle([...RAPID_FIRE]);
     room.gameState.currentQ = 0;
   }
-  broadcastRoom(code, "rapidfire_question", { question: room.gameState.questions[room.gameState.currentQ] });
+  const curQ = room.gameState.questions[room.gameState.currentQ];
+  broadcastRoom(code, "rapidfire_question", { question: { q: curQ.q, options: curQ.options } });
   room.timers.nextQ = setTimeout(() => nextRapidFireQuestion(code), 5000);
 }
 
@@ -1053,7 +1135,7 @@ function handleAnswer(code, playerId, answer, time) {
     if (room.gameState.answers[playerId] !== undefined) return;
     room.gameState.answers[playerId] = answer;
     broadcastRoom(code, "trivial_answer_received", { playerId, total: Object.keys(room.gameState.answers).length });
-    if (Object.keys(room.gameState.answers).length >= room.players.filter(p => !p.eliminated).length) {
+    if (Object.keys(room.gameState.answers).length >= room.players.filter(p => !p.eliminated && !p.disconnected).length) {
       clearTimeout(room.timers.question);
       revealTrivialAnswer(code);
     }
@@ -1061,7 +1143,7 @@ function handleAnswer(code, playerId, answer, time) {
     if (room.gameState.answers[playerId]) return;
     room.gameState.answers[playerId] = { answer, time };
     broadcastRoom(code, "math_answer_received", { playerId, total: Object.keys(room.gameState.answers).length });
-    if (Object.keys(room.gameState.answers).length >= room.players.filter(p => !p.eliminated).length) {
+    if (Object.keys(room.gameState.answers).length >= room.players.filter(p => !p.eliminated && !p.disconnected).length) {
       clearTimeout(room.timers.question);
       revealMathAnswer(code);
     }
@@ -1069,7 +1151,7 @@ function handleAnswer(code, playerId, answer, time) {
     if (room.gameState.votes[playerId] !== undefined) return;
     room.gameState.votes[playerId] = answer;
     broadcastRoom(code, "wyr_vote_received", { total: Object.values(room.gameState.votes).length });
-    if (Object.keys(room.gameState.votes).length >= room.players.filter(p => !p.eliminated).length) {
+    if (Object.keys(room.gameState.votes).length >= room.players.filter(p => !p.eliminated && !p.disconnected).length) {
       clearTimeout(room.timers.question);
       revealWYR(code);
     }
@@ -1106,6 +1188,14 @@ function endGame(code) {
   broadcastRoom(code, "game_over", { players: getSortedPlayers(room), game: room.game });
   // Broadcast updated session leaderboard after game ends
   setTimeout(() => broadcastRoom(code, "session_leaderboard", { leaderboard: sessionLB }), 1000);
+
+  // Reset ready flags and phase → lobby after a short delay so players can return to waiting
+  setTimeout(() => {
+    if (!getRoom(code)) return;
+    room.phase = "lobby";
+    room.players.forEach(p => { p.ready = false; });
+    broadcastRoom(code, "room_state", getRoomState(room));
+  }, 6000);
 }
 
 function clearAllTimers(room) {
