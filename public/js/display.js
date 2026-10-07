@@ -1,6 +1,6 @@
 const socket = io();
 
-let roomCode = "";
+let roomCode = new URLSearchParams(location.search).get("code") || "";
 let currentPlayers = [];
 let voteTimerInterval = null;
 let trivTimerInterval = null;
@@ -9,26 +9,33 @@ let rfTimerInterval = null;
 let playerGrids = {};
 
 const AVATAR_COLORS = ["#7c3aed","#06b6d4","#f59e0b","#10b981","#ef4444","#ec4899","#8b5cf6","#14b8a6","#f97316","#6366f1"];
+const EMOJI_RE = /^emoji:([^|:<>"'\s]{1,12})\|(#[0-9a-fA-F]{3,8})$/u;
+const IMG_RE = /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$/;
 
 function $(id) { return document.getElementById(id); }
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
 
 function showView(name) {
   document.querySelectorAll("[id^='view-']").forEach(el => el.style.display = "none");
   const el = $("view-" + name);
-  if (el) { el.style.display = name === "reaction-dark" ? "flex" : (name === "lobby" ? "block" : "block"); }
+  if (el) el.style.display = name === "reaction-dark" ? "flex" : "block";
 }
 
 function makeAvatarEl(player, size = 44) {
-  if (player.avatar && player.avatar.startsWith("emoji:")) {
-    const parts = player.avatar.split("|");
-    const emoji = player.avatar.split(":")[1].split("|")[0];
-    const color = parts[1] || "#7c3aed";
-    return `<div class="avatar" style="width:${size}px;height:${size}px;background:${color};font-size:${Math.floor(size*0.5)}px;">${emoji}</div>`;
-  } else if (player.avatar && player.avatar.startsWith("data:")) {
-    return `<div class="avatar" style="width:${size}px;height:${size}px;"><img src="${player.avatar}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;"></div>`;
+  const a = player.avatar || "";
+  const m = EMOJI_RE.exec(a);
+  if (m) {
+    return `<div class="avatar" style="width:${size}px;height:${size}px;background:${m[2]};font-size:${Math.floor(size*0.5)}px;">${esc(m[1])}</div>`;
   }
-  const color = AVATAR_COLORS[player.name.charCodeAt(0) % AVATAR_COLORS.length];
-  return `<div class="avatar" style="width:${size}px;height:${size}px;background:${color};font-size:${Math.floor(size*0.4)}px;">${player.name.charAt(0).toUpperCase()}</div>`;
+  if (IMG_RE.test(a)) {
+    return `<div class="avatar" style="width:${size}px;height:${size}px;"><img src="${a}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%;"></div>`;
+  }
+  const name = String(player.name || "?");
+  const color = AVATAR_COLORS[name.charCodeAt(0) % AVATAR_COLORS.length];
+  return `<div class="avatar" style="width:${size}px;height:${size}px;background:${color};font-size:${Math.floor(size*0.4)}px;">${esc(name.charAt(0).toUpperCase())}</div>`;
 }
 
 function updateLeaderboard(players) {
@@ -37,21 +44,21 @@ function updateLeaderboard(players) {
     <div class="lb-row rank-${i+1}" style="${p.eliminated ? 'opacity:0.35;' : ''}">
       <div class="lb-rank">${i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : i+1}</div>
       ${makeAvatarEl(p, 36)}
-      <span class="lb-name">${p.name}</span>
+      <span class="lb-name">${esc(p.name)}</span>
       ${p.eliminated ? '<span class="lb-elim">OUT</span>' : ""}
       <span class="lb-score">${p.score}</span>
     </div>
   `).join("");
 }
 
-function startCountdown(cb) {
+function startCountdown() {
   showView("countdown");
   let n = 3;
   $("countdownNum").textContent = n;
   $("countdownNum").classList.add("scale-in");
   const t = setInterval(() => {
     n--;
-    if (n <= 0) { clearInterval(t); cb(); return; }
+    if (n <= 0) { clearInterval(t); return; }
     $("countdownNum").textContent = n;
     $("countdownNum").classList.remove("scale-in");
     void $("countdownNum").offsetWidth;
@@ -59,25 +66,51 @@ function startCountdown(cb) {
   }, 1000);
 }
 
-// Get QR + code + url on load
-(async () => {
-  const res = await fetch("/qr");
-  const data = await res.json();
-  roomCode = "JOINING";
-  $("displayUrl").textContent = data.url;
-  $("qrImg").src = data.qr;
-})();
+function runBar(barId, duration) {
+  let secs = Math.max(1, Math.round(duration / 1000));
+  const total = secs;
+  $(barId).style.width = "100%";
+  return setInterval(() => {
+    secs--;
+    $(barId).style.width = Math.max(0, (secs / total) * 100) + "%";
+  }, 1000);
+}
 
-socket.emit("display_join", { code: "JOINING" });
+/* ─── ROOM JOIN ───────────────────────────────────────────────────── */
 
-socket.on("connect", () => {
-  fetch("/qr").then(r => r.json()).then(data => {
+function loadQR() {
+  const q = roomCode ? "?code=" + encodeURIComponent(roomCode) : "";
+  fetch("/qr" + q).then(r => r.json()).then(data => {
     $("displayUrl").textContent = data.url;
     $("qrImg").src = data.qr;
-  });
+  }).catch(() => {});
+}
+
+socket.on("connect", () => {
+  socket.emit("display_join", { code: roomCode });
+  loadQR();
 });
 
-socket.on("room_state", ({ players, phase, game }) => {
+socket.on("display_room", ({ code }) => {
+  const changed = code !== roomCode;
+  roomCode = code;
+  $("displayCode").textContent = code;
+  if (changed || !$("qrImg").src) loadQR();
+  socket.emit("display_join", { code });
+});
+
+socket.on("display_waiting", () => {
+  $("displayCode").textContent = "----";
+  $("topGameLabel").textContent = "Waiting for host...";
+});
+
+socket.on("error", ({ msg }) => {
+  $("displayCode").textContent = "----";
+  $("topGameLabel").textContent = msg;
+  roomCode = "";
+});
+
+socket.on("room_state", ({ players, phase }) => {
   currentPlayers = players;
   updateLeaderboard(players);
   updateLobbyPlayers(players);
@@ -86,46 +119,43 @@ socket.on("room_state", ({ players, phase, game }) => {
 
 function updateLobbyPlayers(players) {
   $("lobbyPlayersGrid").innerHTML = players.map(p => `
-    <div class="player-bubble ${p.ready ? "ready" : ""}">
+    <div class="player-bubble ${p.ready ? "ready" : ""}" style="${p.disconnected ? "opacity:0.45;" : ""}">
       ${makeAvatarEl(p, 56)}
-      <div class="pname">${p.name}</div>
+      <div class="pname">${esc(p.name)}</div>
       ${p.ready ? '<div class="tag tag-green" style="font-size:11px;">Ready</div>' : ""}
     </div>
   `).join("");
 }
 
-socket.on("room_created", ({ code }) => {
-  roomCode = code;
-  $("displayCode").textContent = code;
-  socket.emit("display_join", { code });
-});
-
 socket.on("game_selected", ({ game }) => {
   $("topGameLabel").textContent = gameLabel(game);
 });
 
-socket.on("game_start", ({ game, settings }) => {
+socket.on("game_start", ({ game }) => {
   $("topGameLabel").textContent = gameLabel(game);
-  startCountdown(() => {});
+  startCountdown();
 });
 
 function gameLabel(g) {
   const map = { imposter:"🕵️ Who is the Imposter", trivial:"🎯 Trivial Quiz", reaction:"⚡ Reaction Royale",
     wouldyourather:"🤔 Would You Rather", mathquiz:"➕ Math Quiz", fasttyper:"⌨️ Fastest Typer",
-    wordcrack:"🟩 Word Crack", codebreaker:"🔐 Code Breaker", roulette:"🎰 Russian Roulette", rapidfire:"🔥 Rapid Fire" };
+    wordcrack:"🟩 Word Crack", codebreaker:"🔐 Code Breaker", roulette:"🎰 Russian Roulette", rapidfire:"🔥 Rapid Fire",
+    hotpotato:"🥔 Hot Potato" };
   return map[g] || g;
 }
 
-// ─── IMPOSTER ─────────────────────────────────────────────────────────
-socket.on("imposter_round_start", ({ round, playerCount, numImposters }) => {
+/* ─── IMPOSTER ────────────────────────────────────────────────────── */
+
+socket.on("imposter_round_start", ({ round, playerCount, numImposters, active }) => {
   $("topRound").style.display = "";
   $("topRound").textContent = `Round ${round}`;
   showView("imposter");
   $("impDisplayMsg").textContent = `${playerCount} players • ${numImposters} imposter${numImposters > 1 ? "s" : ""} • Say one word out loud!`;
-  $("impWordDisplay").innerHTML = currentPlayers.filter(p => !p.eliminated).map(p => `
-    <div class="player-bubble" id="imp-bubble-${p.id}">
+  const list = active ? currentPlayers.filter(p => active.includes(p.id)) : currentPlayers.filter(p => !p.eliminated);
+  $("impWordDisplay").innerHTML = list.map(p => `
+    <div class="player-bubble">
       ${makeAvatarEl(p, 56)}
-      <div class="pname">${p.name}</div>
+      <div class="pname">${esc(p.name)}</div>
       <div class="tag tag-purple" style="font-size:11px;">Ready</div>
     </div>
   `).join("");
@@ -139,29 +169,23 @@ socket.on("voting_start", ({ duration, players }) => {
   showView("imposter-voting");
   $("displayVoteProgress").textContent = "0/" + players.length + " voted";
   $("displayVoteBoard").innerHTML = players.map(p => `
-    <div class="vote-row" id="dvote-${p.id}">
+    <div class="vote-row" id="dvote-${esc(p.id)}">
       ${makeAvatarEl(p)}
-      <span class="vote-name">${p.name}</span>
-      <div class="vote-indicator" id="dvote-ind-${p.id}"></div>
-      <span class="vote-count" id="dvote-count-${p.id}">0</span>
+      <span class="vote-name">${esc(p.name)}</span>
+      <div class="vote-indicator" id="dvote-ind-${esc(p.id)}"></div>
+      <span class="vote-count" id="dvote-count-${esc(p.id)}">0</span>
     </div>
   `).join("");
 
-  let secs = Math.floor(duration / 1000);
-  $("displayVoteTimer").style.width = "100%";
   clearInterval(voteTimerInterval);
-  voteTimerInterval = setInterval(() => {
-    secs--;
-    $("displayVoteTimer").style.width = Math.max(0, (secs / (duration / 1000)) * 100) + "%";
-    if (secs <= 0) clearInterval(voteTimerInterval);
-  }, 1000);
+  voteTimerInterval = runBar("displayVoteTimer", duration);
 });
 
 socket.on("vote_cast", ({ totalVotes, totalVoters }) => {
   $("displayVoteProgress").textContent = `${totalVotes}/${totalVoters} voted`;
 });
 
-socket.on("voting_result", ({ tally, eliminatedId, eliminatedName, wasImposter, gameOver, word, imposterNames }) => {
+socket.on("voting_result", ({ tally, eliminatedId, eliminatedName, wasImposter, tie, noVotes, gameOver, word, imposterNames }) => {
   clearInterval(voteTimerInterval);
   Object.entries(tally).forEach(([id, count]) => {
     const countEl = $("dvote-count-" + id);
@@ -169,24 +193,23 @@ socket.on("voting_result", ({ tally, eliminatedId, eliminatedName, wasImposter, 
     if (countEl) countEl.textContent = count;
     if (indEl) indEl.innerHTML = Array(count).fill('<div class="vote-dot"></div>').join("");
   });
-  const el = $("dvote-" + eliminatedId);
+  const el = eliminatedId && $("dvote-" + eliminatedId);
   if (el) el.style.background = "rgba(239,68,68,0.2)";
 
   setTimeout(() => {
-    const msg = wasImposter
-      ? `✅ ${eliminatedName} WAS the Imposter! (${word})`
-      : `❌ ${eliminatedName} was NOT the Imposter... (${imposterNames?.join(", ")} was)`;
+    let msg;
+    if (tie) msg = "Tie vote! Nobody was eliminated.";
+    else if (noVotes || !eliminatedName) msg = "Nobody voted. Nobody was eliminated.";
+    else if (wasImposter) msg = `✅ ${eliminatedName} WAS the Imposter! (${word})`;
+    else msg = `❌ ${eliminatedName} was NOT the Imposter... (${(imposterNames || []).join(", ")} was)`;
     $("impDisplayMsg").textContent = msg;
-    if (gameOver) {
-      setTimeout(() => showView("lobby"), 5000);
-    }
-  }, 1000);
+    showView("imposter");
+  }, 1500);
 });
 
-// ─── TRIVIAL ──────────────────────────────────────────────────────────
-let trivDuration = 20;
-socket.on("trivial_question", ({ round, total, question, options, type, duration }) => {
-  trivDuration = duration / 1000;
+/* ─── TRIVIAL ─────────────────────────────────────────────────────── */
+
+socket.on("trivial_question", ({ round, total, question, options, duration }) => {
   showView("trivial");
   $("trivDisplayRound").textContent = `Round ${round}/${total}`;
   $("trivDisplayQ").textContent = question;
@@ -195,22 +218,16 @@ socket.on("trivial_question", ({ round, total, question, options, type, duration
   const borderColors = ["rgba(124,58,237,0.5)","rgba(6,182,212,0.5)","rgba(245,158,11,0.5)","rgba(239,68,68,0.5)"];
   $("trivDisplayOpts").innerHTML = options.map((o, i) => `
     <div id="trivDisp-${i}" style="padding:14px 18px; border-radius:12px; background:${colors[i]}; border:2px solid ${borderColors[i]}; font-size:16px; font-weight:600; display:flex; align-items:center; gap:10px;">
-      <span style="font-family:var(--font-mono); font-size:14px; font-weight:700; opacity:0.7;">${letters[i]}</span>${o}
+      <span style="font-family:var(--font-mono); font-size:14px; font-weight:700; opacity:0.7;">${letters[i]}</span>${esc(o)}
     </div>
   `).join("");
   $("trivAnswerStatus").innerHTML = currentPlayers.map(p => `
-    <div class="answer-chip" id="tchip-${p.id}">
-      <div class="answer-dot waiting" id="tdot-${p.id}"></div>${p.name}
+    <div class="answer-chip" id="tchip-${esc(p.id)}">
+      <div class="answer-dot waiting" id="tdot-${esc(p.id)}"></div>${esc(p.name)}
     </div>
   `).join("");
-  $("trivDisplayTimer").style.width = "100%";
   clearInterval(trivTimerInterval);
-  let secs = trivDuration;
-  trivTimerInterval = setInterval(() => {
-    secs--;
-    $("trivDisplayTimer").style.width = Math.max(0, (secs / trivDuration) * 100) + "%";
-    if (secs <= 0) clearInterval(trivTimerInterval);
-  }, 1000);
+  trivTimerInterval = runBar("trivDisplayTimer", duration);
 });
 
 socket.on("trivial_answer_received", ({ playerId }) => {
@@ -228,11 +245,12 @@ socket.on("trivial_reveal", ({ correctIndex, players }) => {
   updateLeaderboard(players);
 });
 
-// ─── REACTION ─────────────────────────────────────────────────────────
+/* ─── REACTION ────────────────────────────────────────────────────── */
+
 socket.on("reaction_waiting", ({ round, players }) => {
   showView("reaction-dark");
   $("reactionDisplayText").textContent = `ROUND ${round}`;
-  $("reactionDisplaySub").textContent = `${players.length} players — Tap when it flashes!`;
+  $("reactionDisplaySub").textContent = `${players.length} players. Tap when it flashes!`;
   $("reactionDisplayText").style.color = "#fff";
   $("view-reaction-dark").style.background = "#000";
   $("flashScreen").classList.remove("active");
@@ -254,27 +272,29 @@ socket.on("reaction_flash", () => {
 });
 
 socket.on("reaction_result", ({ survived, eliminated, players }) => {
-  $("reactionDisplayText").textContent = eliminated.length > 0 ? `💥 ${eliminated.map(p => p.name).join(", ")} eliminated!` : "✅ Everyone survived!";
-  $("reactionDisplaySub").textContent = `${survived.length} survived`;
+  $("reactionDisplayText").textContent = eliminated.length > 0 ? `💥 ${eliminated.map(p => p.name).join(", ")} eliminated!` : "✅ Nobody eliminated!";
+  $("reactionDisplaySub").textContent = `${survived.length} still in`;
   updateLeaderboard(players);
 });
 
-// ─── WYR ──────────────────────────────────────────────────────────────
+/* ─── WYR ─────────────────────────────────────────────────────────── */
+
 let wyrTotalPlayers = 0;
+
 socket.on("wyr_question", ({ round, total, optionA, optionB }) => {
-  wyrTotalPlayers = currentPlayers.filter(p => !p.eliminated).length;
+  wyrTotalPlayers = currentPlayers.filter(p => !p.eliminated && !p.disconnected).length;
   showView("wyr");
   $("wyrDisplayRound").textContent = `Round ${round}/${total}`;
   $("wyrDisplayProgress").textContent = "0/" + wyrTotalPlayers + " voted";
   $("wyrDisplaySplit").innerHTML = `
     <div class="wyr-side a">
       <div style="font-size:28px; margin-bottom:8px;">🅰️</div>
-      <div>${optionA}</div>
+      <div>${esc(optionA)}</div>
       <div class="wyr-pct" id="wyrDispPctA">—</div>
     </div>
     <div class="wyr-side b">
       <div style="font-size:28px; margin-bottom:8px;">🅱️</div>
-      <div>${optionB}</div>
+      <div>${esc(optionB)}</div>
       <div class="wyr-pct" id="wyrDispPctB">—</div>
     </div>
   `;
@@ -286,35 +306,26 @@ socket.on("wyr_vote_received", ({ total }) => {
 
 socket.on("wyr_reveal", ({ aVotes, bVotes, players }) => {
   const total = aVotes + bVotes || 1;
-  const pctA = Math.round((aVotes / total) * 100);
-  const pctB = Math.round((bVotes / total) * 100);
   const dispA = $("wyrDispPctA");
   const dispB = $("wyrDispPctB");
-  if (dispA) dispA.textContent = pctA + "%";
-  if (dispB) dispB.textContent = pctB + "%";
+  if (dispA) dispA.textContent = Math.round((aVotes / total) * 100) + "%";
+  if (dispB) dispB.textContent = Math.round((bVotes / total) * 100) + "%";
   updateLeaderboard(players);
 });
 
-// ─── MATH ─────────────────────────────────────────────────────────────
-let mathDuration = 15;
+/* ─── MATH ────────────────────────────────────────────────────────── */
+
 socket.on("math_question", ({ round, total, question, duration }) => {
-  mathDuration = duration / 1000;
   showView("math");
   $("mathDisplayRound").textContent = `Round ${round}/${total}`;
   $("mathDisplayQ").textContent = question;
   $("mathAnswerStatus").innerHTML = currentPlayers.map(p => `
-    <div class="answer-chip" id="mchip-${p.id}">
-      <div class="answer-dot waiting" id="mdot-${p.id}"></div>${p.name}
+    <div class="answer-chip" id="mchip-${esc(p.id)}">
+      <div class="answer-dot waiting" id="mdot-${esc(p.id)}"></div>${esc(p.name)}
     </div>
   `).join("");
-  $("mathDisplayTimer").style.width = "100%";
   clearInterval(mathTimerInterval);
-  let secs = mathDuration;
-  mathTimerInterval = setInterval(() => {
-    secs--;
-    $("mathDisplayTimer").style.width = Math.max(0, (secs / mathDuration) * 100) + "%";
-    if (secs <= 0) clearInterval(mathTimerInterval);
-  }, 1000);
+  mathTimerInterval = runBar("mathDisplayTimer", duration);
 });
 
 socket.on("math_answer_received", ({ playerId }) => {
@@ -324,28 +335,29 @@ socket.on("math_answer_received", ({ playerId }) => {
   if (chip) chip.classList.add("done");
 });
 
-socket.on("math_reveal", ({ correctIndex, players }) => {
+socket.on("math_reveal", ({ players }) => {
   clearInterval(mathTimerInterval);
   $("mathDisplayTimer").style.width = "0%";
   updateLeaderboard(players);
 });
 
-// ─── FAST TYPER ───────────────────────────────────────────────────────
+/* ─── FAST TYPER ──────────────────────────────────────────────────── */
+
 socket.on("typing_round", ({ round, total, prompt }) => {
   showView("fasttyper");
   $("typeDisplayRound").textContent = `Round ${round}/${total}`;
   $("typeDisplayPrompt").textContent = prompt;
   $("typeDisplayProgress").innerHTML = currentPlayers.filter(p => !p.eliminated).map(p => `
-    <div class="typing-progress-row" id="tprow-${p.id}">
+    <div class="typing-progress-row">
       ${makeAvatarEl(p, 32)}
-      <span class="typing-progress-name">${p.name}</span>
-      <div class="typing-bar-wrap"><div class="progress-bar"><div class="progress-fill" id="tpbar-${p.id}" style="width:0%"></div></div></div>
-      <span class="typing-time" id="tptime-${p.id}">—</span>
+      <span class="typing-progress-name">${esc(p.name)}</span>
+      <div class="typing-bar-wrap"><div class="progress-bar"><div class="progress-fill" id="tpbar-${esc(p.id)}" style="width:0%"></div></div></div>
+      <span class="typing-time" id="tptime-${esc(p.id)}">—</span>
     </div>
   `).join("");
 });
 
-socket.on("typing_player_done", ({ playerId, position, time, accuracy, players }) => {
+socket.on("typing_player_done", ({ playerId, time, players }) => {
   const bar = $("tpbar-" + playerId);
   const timeEl = $("tptime-" + playerId);
   if (bar) bar.style.width = "100%";
@@ -353,37 +365,23 @@ socket.on("typing_player_done", ({ playerId, position, time, accuracy, players }
   updateLeaderboard(players);
 });
 
-// ─── WORD CRACK ───────────────────────────────────────────────────────
-socket.on("wordcrack_round", ({ round, total, wordLength }) => {
-  playerGrids = {};
-  showView("wordcrack");
-  $("wcDisplayRound").textContent = `Round ${round}/${total}`;
-  $("wcDisplayMsg").textContent = `Find the hidden ${wordLength}-letter word!`;
-  renderWCDisplayGrid();
-});
+/* ─── WORD CRACK AND CODE BREAKER ─────────────────────────────────── */
 
-socket.on("wordcrack_grid_update", ({ playerId, grids }) => {
-  playerGrids = grids;
-  renderWCDisplayGrid();
-});
-
-function renderWCDisplayGrid() {
+function renderGuessGrid(targetId, grids) {
   const players = currentPlayers.filter(p => !p.eliminated);
-  $("wcDisplayGrid").innerHTML = players.map(p => {
-    const guesses = playerGrids[p.id] || [];
+  $(targetId).innerHTML = players.map(p => {
+    const guesses = grids[p.id] || [];
     return `
       <div class="grid-player-card">
         <div class="grid-player-header">
           ${makeAvatarEl(p, 28)}
-          <span>${p.name}</span>
-          <span style="color:var(--text2); font-size:11px; margin-left:auto;">${guesses.length} guess${guesses.length !== 1 ? "es" : ""}</span>
+          <span>${esc(p.name)}</span>
+          <span style="color:var(--text2); font-size:11px; margin-left:auto;">${guesses.length} ${guesses.length === 1 ? "try" : "tries"}</span>
         </div>
         <div style="display:flex; flex-direction:column; gap:3px;">
           ${guesses.slice(-3).map(g => `
             <div style="display:flex; gap:3px;">
-              ${g.guess.split("").map((c, i) => `
-                <div class="wm-cell ${g.result[i]}">${c}</div>
-              `).join("")}
+              ${g.guess.split("").map((c, i) => `<div class="wm-cell ${g.result[i]}">${esc(c)}</div>`).join("")}
             </div>
           `).join("")}
         </div>
@@ -391,118 +389,110 @@ function renderWCDisplayGrid() {
     `;
   }).join("");
 }
+
+socket.on("wordcrack_round", ({ round, total, wordLength }) => {
+  playerGrids = {};
+  showView("wordcrack");
+  $("wcDisplayRound").textContent = `Round ${round}/${total}`;
+  $("wcDisplayMsg").textContent = `Find the hidden ${wordLength}-letter word!`;
+  renderGuessGrid("wcDisplayGrid", playerGrids);
+});
+
+socket.on("wordcrack_grid_update", ({ grids }) => {
+  playerGrids = grids;
+  renderGuessGrid("wcDisplayGrid", playerGrids);
+});
 
 socket.on("wordcrack_solved", ({ name, word, players }) => {
   $("wcDisplayMsg").textContent = `🏆 ${name} cracked it! The word was: ${word}`;
   updateLeaderboard(players);
 });
 
-// ─── CODE BREAKER ─────────────────────────────────────────────────────
+socket.on("wordcrack_timeout", ({ word }) => {
+  $("wcDisplayMsg").textContent = `⏰ Time's up! The word was: ${word}`;
+});
+
 let cbGrids = {};
+
 socket.on("codebreaker_round", ({ round, total }) => {
   cbGrids = {};
   showView("codebreaker");
   $("cbDisplayRound").textContent = `Round ${round}/${total}`;
   $("cbDisplayMsg").textContent = "Crack the 4-digit code!";
-  renderCBDisplayGrid();
+  renderGuessGrid("cbDisplayGrid", cbGrids);
 });
 
-socket.on("codebreaker_grid_update", ({ playerId, grids }) => {
+socket.on("codebreaker_grid_update", ({ grids }) => {
   cbGrids = grids;
-  renderCBDisplayGrid();
+  renderGuessGrid("cbDisplayGrid", cbGrids);
 });
-
-function renderCBDisplayGrid() {
-  const players = currentPlayers.filter(p => !p.eliminated);
-  $("cbDisplayGrid").innerHTML = players.map(p => {
-    const guesses = cbGrids[p.id] || [];
-    return `
-      <div class="grid-player-card">
-        <div class="grid-player-header">
-          ${makeAvatarEl(p, 28)}
-          <span>${p.name}</span>
-          <span style="color:var(--text2); font-size:11px; margin-left:auto;">${guesses.length} tries</span>
-        </div>
-        <div style="display:flex; flex-direction:column; gap:3px;">
-          ${guesses.slice(-3).map(g => `
-            <div style="display:flex; gap:3px;">
-              ${g.guess.split("").map((c, i) => `
-                <div class="wm-cell ${g.result[i]}">${c}</div>
-              `).join("")}
-            </div>
-          `).join("")}
-        </div>
-      </div>
-    `;
-  }).join("");
-}
 
 socket.on("codebreaker_solved", ({ name, code: secret, players }) => {
   $("cbDisplayMsg").textContent = `🏆 ${name} cracked it! Code: ${secret}`;
   updateLeaderboard(players);
 });
 
-// ─── ROULETTE ─────────────────────────────────────────────────────────
-socket.on("roulette_round", ({ order }) => {
-  showView("roulette");
-  $("rouletteDisplayGun").textContent = "🔫";
-  updateRouletteDisplay(order.map(p => p.name), order[0]);
-  $("rouletteDisplayChambers").innerHTML = Array(6).fill(0).map((_, i) => `
-    <div style="width:32px;height:32px;border-radius:50%;background:${i===0?'rgba(239,68,68,0.3)':'var(--surface2)'};border:2px solid ${i===0?'var(--danger)':'var(--border)'};display:flex;align-items:center;justify-content:center;">
-      ${i === 0 ? "●" : "○"}
-    </div>
-  `).join("");
+socket.on("codebreaker_timeout", ({ code: secret }) => {
+  $("cbDisplayMsg").textContent = `⏰ Time's up! Code was: ${secret}`;
 });
 
-function updateRouletteDisplay(names, currentId) {
+/* ─── ROULETTE ────────────────────────────────────────────────────── */
+
+function updateRouletteDisplay(currentId) {
   const cur = currentPlayers.find(p => p.id === currentId);
   $("rouletteDisplayTurn").textContent = cur ? `${cur.name}'s Turn` : "Waiting...";
   $("rouletteDisplaySub").textContent = "Spin or Shoot?";
   $("rouletteDisplayPlayers").innerHTML = currentPlayers.filter(p => !p.eliminated).map(p => `
     <div style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px;border-radius:10px;background:${p.id===currentId?'rgba(124,58,237,0.2)':'var(--surface2)'};border:1px solid ${p.id===currentId?'var(--accent)':'var(--border)'};">
       ${makeAvatarEl(p, 36)}
-      <span style="font-size:12px;font-weight:600;">${p.name}</span>
+      <span style="font-size:12px;font-weight:600;">${esc(p.name)}</span>
     </div>
   `).join("");
 }
 
-socket.on("roulette_next", ({ currentPlayer, name }) => {
-  $("rouletteDisplayTurn").textContent = `${name}'s Turn`;
+socket.on("roulette_round", ({ currentPlayer }) => {
+  showView("roulette");
   $("rouletteDisplayGun").textContent = "🔫";
-  updateRouletteDisplay([], currentPlayer);
+  updateRouletteDisplay(currentPlayer);
+  $("rouletteDisplayChambers").innerHTML = Array(6).fill(0).map(() => `
+    <div style="width:32px;height:32px;border-radius:50%;background:var(--surface2);border:2px solid var(--border);display:flex;align-items:center;justify-content:center;">○</div>
+  `).join("");
 });
 
-socket.on("roulette_spin", ({ playerId }) => {
+socket.on("roulette_next", ({ currentPlayer }) => {
+  $("rouletteDisplayGun").textContent = "🔫";
+  updateRouletteDisplay(currentPlayer);
+});
+
+socket.on("roulette_spin", () => {
   $("rouletteDisplayGun").textContent = "🌀";
   $("rouletteDisplaySub").textContent = "Spinning the barrel...";
   setTimeout(() => { $("rouletteDisplayGun").textContent = "🔫"; }, 2000);
 });
 
-socket.on("roulette_safe", ({ playerId }) => {
+socket.on("roulette_safe", () => {
   $("rouletteDisplayGun").textContent = "💨";
   $("rouletteDisplaySub").textContent = "Click! Safe...";
   setTimeout(() => { $("rouletteDisplayGun").textContent = "🔫"; }, 1500);
 });
 
-socket.on("roulette_bang", ({ playerId, name }) => {
+socket.on("roulette_bang", ({ name }) => {
   $("rouletteDisplayGun").textContent = "💥";
   $("rouletteDisplayTurn").textContent = `💀 ${name} ELIMINATED!`;
   $("rouletteDisplayTurn").style.color = "var(--danger)";
   setTimeout(() => { $("rouletteDisplayTurn").style.color = ""; }, 3000);
 });
 
-// ─── RAPID FIRE ───────────────────────────────────────────────────────
-let rfTotalDuration = 60000;
-let rfEndTime = 0;
+/* ─── RAPID FIRE ──────────────────────────────────────────────────── */
+
 socket.on("rapidfire_start", ({ duration, question }) => {
-  rfTotalDuration = duration;
-  rfEndTime = Date.now() + duration;
   showView("rapidfire");
   renderRFQuestion(question);
   clearInterval(rfTimerInterval);
+  const end = Date.now() + duration;
   rfTimerInterval = setInterval(() => {
-    const rem = Math.max(0, rfEndTime - Date.now());
-    $("rfDisplayTimer").style.width = (rem / rfTotalDuration * 100) + "%";
+    const rem = Math.max(0, end - Date.now());
+    $("rfDisplayTimer").style.width = (rem / duration * 100) + "%";
     if (rem <= 0) clearInterval(rfTimerInterval);
   }, 100);
 });
@@ -516,7 +506,7 @@ function renderRFQuestion(q) {
   const sides = ["a","b","c","d"];
   const letters = ["A","B","C","D"];
   $("rfDisplayOpts").innerHTML = q.options.map((o, i) => `
-    <div class="rf-opt ${sides[i]}"><span style="font-family:var(--font-mono);opacity:0.6;">${letters[i]}</span> ${o}</div>
+    <div class="rf-opt ${sides[i]}"><span style="font-family:var(--font-mono);opacity:0.6;">${letters[i]}</span> ${esc(o)}</div>
   `).join("");
 }
 
@@ -528,7 +518,55 @@ socket.on("rapidfire_end", () => {
   clearInterval(rfTimerInterval);
 });
 
-// ─── GAME OVER ────────────────────────────────────────────────────────
+/* ─── HOT POTATO ──────────────────────────────────────────────────── */
+
+let potPlayers = [];
+let potHolder = null;
+
+function renderPotatoPlayers() {
+  $("potDisplayPlayers").innerHTML = potPlayers.map(p => `
+    <div style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px;border-radius:10px;background:${p.id===potHolder?'rgba(239,68,68,0.2)':'var(--surface2)'};border:1px solid ${p.id===potHolder?'var(--danger)':'var(--border)'};">
+      ${makeAvatarEl(p, 36)}
+      <span style="font-size:12px;font-weight:600;">${esc(p.name)}</span>
+    </div>
+  `).join("");
+}
+
+socket.on("potato_round", ({ round, holderId, holderName, players }) => {
+  potPlayers = players;
+  potHolder = holderId;
+  showView("hotpotato");
+  $("topRound").style.display = "";
+  $("topRound").textContent = `Round ${round}`;
+  $("potDisplayRound").textContent = `Round ${round}`;
+  $("potDisplayIcon").classList.add("hot");
+  $("potDisplayIcon").textContent = "🥔";
+  $("potDisplayHolder").style.color = "";
+  $("potDisplayHolder").textContent = `${holderName} has the potato!`;
+  $("potDisplaySub").textContent = "Pass it on before it explodes!";
+  renderPotatoPlayers();
+});
+
+socket.on("potato_pass", ({ fromName, toId, toName, passes }) => {
+  potHolder = toId;
+  $("potDisplayHolder").textContent = `${toName} has the potato!`;
+  $("potDisplaySub").textContent = `${fromName} passed it (${passes} pass${passes === 1 ? "" : "es"})`;
+  renderPotatoPlayers();
+});
+
+socket.on("potato_boom", ({ name, remaining, gameOver, players }) => {
+  $("potDisplayIcon").classList.remove("hot");
+  $("potDisplayIcon").textContent = "💥";
+  $("potDisplayHolder").style.color = "var(--danger)";
+  $("potDisplayHolder").textContent = `💀 ${name} EXPLODED!`;
+  $("potDisplaySub").textContent = gameOver ? "We have a winner!" : `${remaining} players left`;
+  potPlayers = potPlayers.filter(p => p.name !== name);
+  renderPotatoPlayers();
+  updateLeaderboard(players);
+});
+
+/* ─── GAME OVER ───────────────────────────────────────────────────── */
+
 socket.on("game_over", ({ players }) => {
   currentPlayers = players;
   clearInterval(rfTimerInterval);
@@ -537,12 +575,12 @@ socket.on("game_over", ({ players }) => {
   clearInterval(voteTimerInterval);
   showView("gameover");
   const winner = players[0];
-  $("winnerDisplayName").textContent = winner?.name || "—";
+  $("winnerDisplayName").textContent = winner ? winner.name : "—";
   $("gameoverLB").innerHTML = players.map((p, i) => `
     <div class="lb-row rank-${i+1}">
       <div class="lb-rank">${i===0?"🥇":i===1?"🥈":i===2?"🥉":i+1}</div>
       ${makeAvatarEl(p)}
-      <span class="lb-name">${p.name}</span>
+      <span class="lb-name">${esc(p.name)}</span>
       <span class="lb-score">${p.score} pts</span>
     </div>
   `).join("");

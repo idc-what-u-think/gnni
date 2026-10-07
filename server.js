@@ -9,23 +9,58 @@ const crypto = require("crypto");
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" },
   transports: ["polling", "websocket"],
-  pingTimeout: 60000,
-  pingInterval: 25000
+  pingTimeout: 20000,
+  pingInterval: 10000,
+  maxHttpBufferSize: 2e5
 });
 
-// ─── ONE-TIME HOST CODE ───────────────────────────────────────────────
-const HOST_CODE = crypto.randomBytes(3).toString("hex").toUpperCase();
+const PORT = process.env.PORT || 3000;
+const HOST_CODE = crypto.randomBytes(4).toString("hex").toUpperCase();
+const START_DELAY = 3000;
+const GRACE_MS = 60000;
+const MAX_PLAYERS = 15;
 
-app.use(express.static(path.join(__dirname, "public")));
-app.use(express.json());
+const rooms = {};
+const graceTimers = new Map();
+const pendingDisplays = new Set();
+const hostAttempts = new Map();
+let latestRoomCode = null;
 
-// Auth middleware for host page
-app.get("/host", (req, res) => {
-  const token = req.query.code;
-  if (token !== HOST_CODE) {
-    return res.send(`<!DOCTYPE html><html><head><title>Host Login</title>
+/* ─── AUTH HELPERS ─────────────────────────────────────────────────── */
+
+function digest(s) {
+  return crypto.createHash("sha256").update(String(s)).digest();
+}
+
+function safeEq(a, b) {
+  return crypto.timingSafeEqual(digest(a), digest(b));
+}
+
+function attemptAllowed(ip) {
+  const rec = hostAttempts.get(ip);
+  if (!rec || Date.now() > rec.reset) return true;
+  return rec.n < 8;
+}
+
+function recordFailure(ip) {
+  const now = Date.now();
+  const rec = hostAttempts.get(ip);
+  if (!rec || now > rec.reset) hostAttempts.set(ip, { n: 1, reset: now + 10 * 60 * 1000 });
+  else rec.n++;
+}
+
+function socketIp(socket) {
+  return (socket.handshake && socket.handshake.address) || "unknown";
+}
+
+/* ─── HTTP ─────────────────────────────────────────────────────────── */
+
+app.disable("x-powered-by");
+app.use(express.static(path.join(__dirname, "public"), { index: false, dotfiles: "ignore" }));
+
+function loginPage(wrong) {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Host Login</title>
     <style>
       body{font-family:sans-serif;background:#0f0f13;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
       .box{background:#1a1a24;border:1px solid #2a2a3a;border-radius:16px;padding:40px;width:320px;text-align:center;}
@@ -35,25 +70,35 @@ app.get("/host", (req, res) => {
       input:focus{border-color:#7c3aed;}
       button{width:100%;padding:12px;border-radius:8px;background:#7c3aed;color:#fff;border:none;font-size:15px;font-weight:700;cursor:pointer;}
       button:hover{background:#6d28d9;}
-      .err{color:#ef4444;font-size:13px;margin-top:10px;display:none;}
+      .err{color:#ef4444;font-size:13px;margin-top:10px;display:${wrong ? "block" : "none"};}
     </style></head><body>
     <div class="box">
-      <h2>🎮 HOST LOGIN</h2>
+      <h2>HOST LOGIN</h2>
       <p>Enter the host code shown in your terminal</p>
-      <input type="text" id="c" placeholder="XXXXXX" maxlength="6" oninput="this.value=this.value.toUpperCase()">
+      <input type="text" id="c" placeholder="XXXXXXXX" maxlength="8" autocomplete="off" oninput="this.value=this.value.toUpperCase()">
       <button onclick="go()">Enter</button>
-      <div class="err" id="err">Wrong code</div>
+      <div class="err" id="err">${wrong === "limited" ? "Too many attempts. Try again later." : "Wrong code"}</div>
     </div>
     <script>
       function go(){
-        const v=document.getElementById('c').value.trim();
+        var v=document.getElementById('c').value.trim();
         if(!v){return;}
-        window.location.href='/host?code='+v;
+        window.location.href='/host?code='+encodeURIComponent(v);
       }
-      document.getElementById('c').addEventListener('keydown',e=>{if(e.key==='Enter')go();});
-    </script></body></html>`);
+      document.getElementById('c').addEventListener('keydown',function(e){if(e.key==='Enter')go();});
+    </script></body></html>`;
+}
+
+app.get("/host", (req, res) => {
+  const token = typeof req.query.code === "string" ? req.query.code : "";
+  const ip = req.ip || (req.socket && req.socket.remoteAddress) || "unknown";
+  if (!token) return res.send(loginPage(false));
+  if (!attemptAllowed(ip)) return res.status(429).send(loginPage("limited"));
+  if (!safeEq(token.toUpperCase(), HOST_CODE)) {
+    recordFailure(ip);
+    return res.status(401).send(loginPage(true));
   }
-  res.sendFile(path.join(__dirname, "public/host.html"));
+  res.sendFile(path.join(__dirname, "views/host.html"));
 });
 
 app.get("/display", (req, res) => res.sendFile(path.join(__dirname, "public/display.html")));
@@ -61,83 +106,142 @@ app.get("/", (req, res) => res.sendFile(path.join(__dirname, "public/index.html"
 
 function getLocalIP() {
   const interfaces = os.networkInterfaces();
+  let fallback = null;
   for (const name of Object.keys(interfaces)) {
     for (const iface of interfaces[name]) {
-      if (iface.family === "IPv4" && !iface.internal) return iface.address;
+      if (iface.family !== "IPv4" || iface.internal) continue;
+      if (/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(iface.address)) return iface.address;
+      if (!fallback) fallback = iface.address;
     }
   }
-  return "localhost";
+  return fallback || "localhost";
+}
+
+function baseUrl(req) {
+  if (process.env.RENDER_EXTERNAL_URL) return process.env.RENDER_EXTERNAL_URL.replace(/\/$/, "");
+  const fwd = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+  const proto = fwd === "https" || fwd === "http" ? fwd : (req.protocol || "http");
+  let host = String(req.headers.host || "");
+  if (!/^[A-Za-z0-9.\-:\[\]]+$/.test(host)) host = `${getLocalIP()}:${PORT}`;
+  if (/^(localhost|127\.0\.0\.1|\[::1\])(:|$)/i.test(host)) {
+    const m = host.match(/:(\d+)$/);
+    host = `${getLocalIP()}:${m ? m[1] : PORT}`;
+  }
+  return `${proto}://${host}`;
 }
 
 app.get("/qr", async (req, res) => {
-  // On Render (or any cloud), use the public URL from env or request host
-  const publicUrl = process.env.RENDER_EXTERNAL_URL
-    || `https://${req.headers.host}`
-    || `http://${getLocalIP()}:${PORT}`;
-  const url = publicUrl.replace(/\/$/, "");
-  const qr = await QRCode.toDataURL(url);
-  res.json({ qr, url });
-});
-
-// ─── GLOBAL SESSION LEADERBOARD ───────────────────────────────────────
-// Tracks cumulative scores across all games in the session
-const sessionLeaderboard = {}; // { playerName: { name, avatar, totalScore, gamesPlayed, wins } }
-
-function updateSessionLeaderboard(room) {
-  room.players.forEach(p => {
-    if (!sessionLeaderboard[p.name]) {
-      sessionLeaderboard[p.name] = { name: p.name, avatar: p.avatar, totalScore: 0, gamesPlayed: 0, wins: 0 };
-    }
-    sessionLeaderboard[p.name].totalScore += p.score;
-    sessionLeaderboard[p.name].gamesPlayed += 1;
-    sessionLeaderboard[p.name].avatar = p.avatar;
-  });
-
-  const sorted = [...room.players].sort((a, b) => b.score - a.score);
-  if (sorted[0]) {
-    if (!sessionLeaderboard[sorted[0].name]) {
-      sessionLeaderboard[sorted[0].name] = { name: sorted[0].name, avatar: sorted[0].avatar, totalScore: 0, gamesPlayed: 0, wins: 0 };
-    }
-    sessionLeaderboard[sorted[0].name].wins += 1;
+  try {
+    const base = baseUrl(req);
+    const code = normCode(req.query.code);
+    const joinUrl = code && rooms[code] ? `${base}/?code=${code}` : base;
+    const qr = await QRCode.toDataURL(joinUrl);
+    res.json({ qr, url: base });
+  } catch (e) {
+    res.status(500).json({ error: "qr_failed" });
   }
-}
-
-function getSessionLeaderboard() {
-  return Object.values(sessionLeaderboard).sort((a, b) => b.totalScore - a.totalScore);
-}
+});
 
 app.get("/session-leaderboard", (req, res) => {
-  res.json({ leaderboard: getSessionLeaderboard() });
+  const room = rooms[normCode(req.query.code)];
+  res.json({ leaderboard: room ? getSessionLeaderboard(room) : [] });
 });
 
-const rooms = {};
+/* ─── GENERIC HELPERS ──────────────────────────────────────────────── */
 
-function generateCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  return Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+function normCode(c) {
+  return typeof c === "string" ? c.trim().toUpperCase().slice(0, 4) : "";
 }
 
-function getRoom(code) { return rooms[code]; }
-
-function broadcastRoom(code, event, data) {
-  io.to(code).emit(event, data);
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
 }
 
-function getRoomState(room) {
-  return {
-    players: room.players.map(p => ({
-      id: p.id, name: p.name, avatar: p.avatar,
-      score: p.score, lives: p.lives, eliminated: p.eliminated,
-      ready: p.ready, disconnected: p.disconnected || false
-    })),
-    game: room.game,
-    gameState: room.gameState,
-    phase: room.phase,
-    settings: room.settings
-  };
+function rand(n) {
+  return Math.floor(Math.random() * n);
 }
 
-const WORDS = [
+function cleanText(s, max) {
+  if (typeof s !== "string") return "";
+  return s.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function cleanName(n) {
+  if (typeof n !== "string") return "";
+  return n.replace(/[\u0000-\u001f\u007f<>]/g, "").replace(/\s+/g, " ").trim().slice(0, 16);
+}
+
+const EMOJI_AVATAR = /^emoji:[^|:<>"'\s]{1,12}\|#[0-9a-fA-F]{3,8}$/u;
+const IMG_AVATAR = /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$/;
+
+function cleanAvatar(a) {
+  if (typeof a !== "string" || a.length > 60000) return null;
+  return EMOJI_AVATAR.test(a) || IMG_AVATAR.test(a) ? a : null;
+}
+
+function cleanQuestions(raw) {
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  for (const q of raw.slice(0, 200)) {
+    if (!q || typeof q !== "object") continue;
+    const text = cleanText(q.q, 200);
+    if (!text) continue;
+    const type = q.type === "tf" ? "tf" : "mcq";
+    let options = ["True", "False"];
+    if (type === "mcq") {
+      if (!Array.isArray(q.options)) continue;
+      options = q.options.slice(0, 4).map(o => cleanText(o, 80));
+      if (options.length < 2 || options.some(o => !o)) continue;
+    }
+    const answer = Number.isInteger(q.answer) && q.answer >= 0 && q.answer < options.length ? q.answer : 0;
+    out.push({ q: text, options, answer, type });
+  }
+  return out.length ? out : null;
+}
+
+const SETTING_DEFS = {
+  imposter: { imposters: { min: 1, max: 4, def: 1 }, votingTime: { min: 10, max: 120, def: 30 } },
+  trivial: { rounds: { min: 3, max: 30, def: 10 }, questionTime: { min: 5, max: 60, def: 20 } },
+  reaction: { rounds: { min: 1, max: 10, def: 5 }, mode: { opts: ["laststanding", "mosttaps"], def: "laststanding" } },
+  wouldyourather: { rounds: { min: 3, max: 20, def: 10 } },
+  mathquiz: {
+    rounds: { min: 3, max: 20, def: 10 },
+    questionTime: { min: 5, max: 60, def: 15 },
+    difficulty: { opts: ["easy", "medium", "hard"], def: "medium" }
+  },
+  fasttyper: { rounds: { min: 2, max: 10, def: 5 } },
+  wordcrack: { rounds: { min: 2, max: 10, def: 5 } },
+  codebreaker: { rounds: { min: 2, max: 10, def: 5 } },
+  roulette: { mode: { opts: ["laststanding", "mostrounds"], def: "laststanding" } },
+  rapidfire: { duration: { min: 30, max: 180, def: 60 } },
+  hotpotato: { fuse: { opts: ["short", "medium", "long"], def: "medium" } }
+};
+
+const MIN_PLAYERS = { imposter: 3, hotpotato: 3 };
+
+function cleanSettings(game, raw) {
+  const defs = SETTING_DEFS[game];
+  if (!defs) return null;
+  const src = raw && typeof raw === "object" ? raw : {};
+  const out = {};
+  for (const [k, d] of Object.entries(defs)) {
+    if (d.opts) out[k] = d.opts.includes(src[k]) ? src[k] : d.def;
+    else {
+      const n = parseInt(src[k], 10);
+      out[k] = Number.isFinite(n) ? Math.min(d.max, Math.max(d.min, n)) : d.def;
+    }
+  }
+  return out;
+}
+
+/* ─── CONTENT ──────────────────────────────────────────────────────── */
+
+const WORDS = [...new Set([
   "apple","bicycle","camera","diamond","elephant","forest","guitar","hammer","island","jungle",
   "kitchen","library","mountain","notebook","ocean","pillow","queen","rocket","shadow","table",
   "umbrella","violin","window","xylophone","yellow","zebra","airplane","bridge","candle","desert",
@@ -157,8 +261,8 @@ const WORDS = [
   "minor","nerve","onset","plank","quota","ranch","screw","thorn","ultra","venom",
   "wheat","oxide","yodel","zones","adopt","bloom","coast","dwarf","elder","flank",
   "giant","hyena","imply","joker","knave","lyric","metal","noble","opera","piano",
-  "quail","realm","scout","trend","union","vigor","wheat","axiom","yield","zenith"
-];
+  "quail","realm","scout","trend","union","vigor","axiom","yield","zenith"
+])].map(w => w.toUpperCase());
 
 const WOULD_YOU_RATHER = [
   ["Always be 10 minutes late", "Always be 20 minutes early"],
@@ -180,7 +284,7 @@ const WOULD_YOU_RATHER = [
   ["Always have to sing instead of speak", "Always have to dance instead of walk"],
   ["Never sleep again", "Never have to eat again"],
   ["Know all the secrets of the universe", "Know every person you meet truly likes you"],
-  ["Be 4 feet tall", "Be 8 feet tall"],
+  ["Be 4 feet tall", "Be 8 feet tall"]
 ];
 
 const TRIVIA = [
@@ -198,7 +302,7 @@ const TRIVIA = [
   { q: "The Great Wall of China is visible from space.", options: ["True","False"], answer: 1, type: "tf" },
   { q: "Which country is the largest by area?", options: ["China","USA","Canada","Russia"], answer: 3, type: "mcq" },
   { q: "Sound travels faster than light.", options: ["True","False"], answer: 1, type: "tf" },
-  { q: "What gas do plants absorb?", options: ["Oxygen","Nitrogen","CO2","Hydrogen"], answer: 2, type: "mcq" },
+  { q: "What gas do plants absorb?", options: ["Oxygen","Nitrogen","CO2","Hydrogen"], answer: 2, type: "mcq" }
 ];
 
 const RAPID_FIRE = [
@@ -221,7 +325,7 @@ const RAPID_FIRE = [
   { q: "How many colors in a rainbow?", options: ["5","6","7","8"], answer: 2 },
   { q: "What is H2O?", options: ["Fire","Air","Water","Earth"], answer: 2 },
   { q: "What is 15 + 7?", options: ["21","22","23","24"], answer: 1 },
-  { q: "Which is the tallest mountain?", options: ["K2","Kilimanjaro","Everest","Alps"], answer: 2 },
+  { q: "Which is the tallest mountain?", options: ["K2","Kilimanjaro","Everest","Alps"], answer: 2 }
 ];
 
 const TYPING_PROMPTS = [
@@ -239,7 +343,7 @@ const TYPING_PROMPTS = [
   "Life is what happens when you are busy making plans",
   "In the middle of difficulty lies opportunity for greatness",
   "Knowledge is power but wisdom is knowing when to use it",
-  "The best way to predict your future is to create it",
+  "The best way to predict your future is to create it"
 ];
 
 function generateMathQuestion(difficulty) {
@@ -247,36 +351,34 @@ function generateMathQuestion(difficulty) {
   let a, b, op, answer, question;
 
   if (difficulty === "easy") {
-    a = Math.floor(Math.random() * 20) + 1;
-    b = Math.floor(Math.random() * 20) + 1;
-    op = ops[Math.floor(Math.random() * 2)];
+    a = rand(20) + 1;
+    b = rand(20) + 1;
+    op = ops[rand(2)];
   } else if (difficulty === "medium") {
-    a = Math.floor(Math.random() * 50) + 10;
-    b = Math.floor(Math.random() * 30) + 5;
-    op = ops[Math.floor(Math.random() * 3)];
+    a = rand(50) + 10;
+    b = rand(30) + 5;
+    op = ops[rand(3)];
   } else {
-    op = ops[Math.floor(Math.random() * 4)];
+    op = ops[rand(4)];
     if (Math.random() > 0.5) {
-      const base = Math.floor(Math.random() * 10) + 2;
-      const squared = base * base;
-      question = `√${squared}`;
+      const base = rand(10) + 2;
+      question = `√${base * base}`;
       answer = base;
-      const wrong = [answer + 1, answer - 1, answer + 2].filter(x => x > 0);
-      const opts = shuffle([answer, ...wrong.slice(0, 3)]);
+      const opts = shuffle([answer, answer + 1, answer - 1, answer + 2]);
       return { question, answer: opts.indexOf(answer), options: opts.map(String) };
     }
-    a = Math.floor(Math.random() * 100) + 10;
-    b = Math.floor(Math.random() * 50) + 5;
+    a = rand(100) + 10;
+    b = rand(50) + 5;
   }
 
   if (op === "/") {
-    b = Math.floor(Math.random() * 9) + 2;
-    a = b * (Math.floor(Math.random() * 10) + 1);
+    b = rand(9) + 2;
+    a = b * (rand(10) + 1);
     answer = a / b;
     question = `${a} ÷ ${b}`;
   } else if (op === "*") {
-    a = Math.floor(Math.random() * 12) + 2;
-    b = Math.floor(Math.random() * 12) + 2;
+    a = rand(12) + 2;
+    b = rand(12) + 2;
     answer = a * b;
     question = `${a} × ${b}`;
   } else {
@@ -288,931 +390,1313 @@ function generateMathQuestion(difficulty) {
   const offsets = [1, 2, 3, 5, 10];
   const wrong = new Set();
   while (wrong.size < 3) {
-    const offset = offsets[Math.floor(Math.random() * offsets.length)];
+    const offset = offsets[rand(offsets.length)];
     const w = answer + (Math.random() > 0.5 ? offset : -offset);
     if (w !== answer && w >= 0) wrong.add(w);
   }
-  const opts = shuffle([answer, ...[...wrong].slice(0, 3)]);
+  const opts = shuffle([answer, ...wrong]);
   return { question, answer: opts.indexOf(answer), options: opts.map(String) };
 }
 
-function shuffle(arr) {
-  return [...arr].sort(() => Math.random() - 0.5);
+/* ─── ROOM MODEL ───────────────────────────────────────────────────── */
+
+function generateCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code;
+  do {
+    code = Array.from({ length: 4 }, () => chars[rand(chars.length)]).join("");
+  } while (rooms[code]);
+  return code;
 }
 
-function getRandomWord() {
-  return WORDS[Math.floor(Math.random() * WORDS.length)].toUpperCase();
+function newRoom() {
+  const code = generateCode();
+  rooms[code] = {
+    code,
+    hostSocketId: null,
+    hostKey: crypto.randomBytes(16).toString("hex"),
+    hostConnected: true,
+    players: [],
+    game: null,
+    phase: "lobby",
+    gameState: {},
+    settings: {},
+    questions: null,
+    deck: [],
+    round: 0,
+    total: 0,
+    timers: new Set(),
+    replay: [],
+    priv: {},
+    lb: {},
+    lastActive: Date.now()
+  };
+  return rooms[code];
 }
 
-io.on("connection", (socket) => {
-
-  socket.on("create_room", ({ hostId }) => {
-    const code = generateCode();
-    rooms[code] = {
-      code,
-      hostId,
-      displayId: null,
-      players: [],
-      game: null,
-      phase: "lobby",
-      gameState: {},
-      settings: {},
-      timers: {}
-    };
-    socket.join(code);
-    socket.emit("room_created", { code });
-    // Send session leaderboard to host on room create
-    socket.emit("session_leaderboard", { leaderboard: getSessionLeaderboard() });
+function deleteRoom(room) {
+  clearAllTimers(room);
+  room.players.forEach(p => {
+    const t = graceTimers.get(p.token);
+    if (t) { clearTimeout(t); graceTimers.delete(p.token); }
   });
+  delete rooms[room.code];
+  if (latestRoomCode === room.code) latestRoomCode = null;
+}
 
-  socket.on("display_join", ({ code }) => {
-    const room = getRoom(code);
-    if (!room) return socket.emit("error", { msg: "Room not found" });
-    room.displayId = socket.id;
-    socket.join(code);
-    socket.emit("room_state", getRoomState(room));
-  });
+function touch(room) {
+  room.lastActive = Date.now();
+}
 
-  socket.on("player_join", ({ code, name, avatar, reconnectToken }) => {
-    const room = getRoom(code);
-    if (!room) return socket.emit("error", { msg: "Room not found" });
+function findPlayer(room, id) {
+  return room.players.find(p => p.id === id);
+}
 
-    // ── RECONNECT PATH ──────────────────────────────────────────────
-    if (reconnectToken) {
-      const ghost = room.players.find(p => p.reconnectToken === reconnectToken);
-      if (ghost) {
-        if (ghost._disconnectTimer) {
-          clearTimeout(ghost._disconnectTimer);
-          ghost._disconnectTimer = null;
-        }
-        ghost.id = socket.id;
-        ghost.disconnected = false;
-        socket.join(code);
-        socket.data.roomCode = code;
-        socket.emit("joined", { player: ghost, code, reconnectToken: ghost.reconnectToken });
-        socket.emit("session_leaderboard", { leaderboard: getSessionLeaderboard() });
-        broadcastRoom(code, "player_reconnected", { id: ghost.id, name: ghost.name });
-        broadcastRoom(code, "room_state", getRoomState(room));
-        if (room.phase === "playing" && room.game) {
-          socket.emit("game_start", { game: room.game, settings: room.settings });
-        }
-        return;
-      }
-      // Token not found — fall through to fresh join
+function publicPlayer(p) {
+  return {
+    id: p.id, name: p.name, avatar: p.avatar, score: p.score, lives: p.lives,
+    eliminated: p.eliminated, ready: p.ready, disconnected: p.disconnected
+  };
+}
+
+function getSortedPlayers(room) {
+  return [...room.players]
+    .sort((a, b) => b.score - a.score)
+    .map((p, i) => ({ ...publicPlayer(p), rank: i + 1 }));
+}
+
+function publicSettings(room) {
+  const s = { ...room.settings };
+  if (room.questions) s.questionCount = room.questions.length;
+  return s;
+}
+
+function getRoomState(room) {
+  return {
+    players: room.players.map(publicPlayer),
+    game: room.game,
+    phase: room.phase,
+    settings: publicSettings(room),
+    round: room.round
+  };
+}
+
+function activePlayers(room) {
+  return room.players.filter(p => !p.eliminated);
+}
+
+function livePlayers(room) {
+  return room.players.filter(p => !p.eliminated && !p.disconnected);
+}
+
+function allAnswered(room, map) {
+  const live = livePlayers(room);
+  return live.length > 0 && live.every(p => map[p.id] !== undefined);
+}
+
+/* ─── SCHEDULER AND EMIT HELPERS ───────────────────────────────────── */
+
+function later(room, fn, ms) {
+  const t = setTimeout(() => {
+    room.timers.delete(t);
+    try { fn(); } catch (e) { console.error("timer error:", e); }
+  }, ms);
+  room.timers.add(t);
+  return t;
+}
+
+function cancel(room, t) {
+  if (!t) return;
+  clearTimeout(t);
+  room.timers.delete(t);
+}
+
+function clearAllTimers(room) {
+  room.timers.forEach(t => clearTimeout(t));
+  room.timers.clear();
+}
+
+function toRoom(room, ev, data) {
+  io.to(room.code).emit(ev, data);
+}
+
+function toDisplay(room, ev, data) {
+  io.to(room.code + ":d").emit(ev, data);
+}
+
+function toPlayer(room, p, ev, data) {
+  if (p && p.socketId && !p.disconnected) io.to(p.socketId).emit(ev, data);
+}
+
+function resetReplay(room) {
+  room.replay = [];
+  room.priv = {};
+}
+
+function pub(room, ev, data, replace) {
+  toRoom(room, ev, data);
+  if (replace) room.replay = room.replay.filter(e => e.ev !== ev);
+  room.replay.push({ ev, data, at: Date.now() });
+}
+
+function priv(room, p, ev, data) {
+  toPlayer(room, p, ev, data);
+  (room.priv[p.id] = room.priv[p.id] || []).push({ ev, data, at: Date.now() });
+}
+
+function replayEvents(room, list, send) {
+  const now = Date.now();
+  list.forEach(e => {
+    let d = e.data;
+    if (d && typeof d === "object" && typeof d.duration === "number") {
+      d = { ...d, duration: Math.max(500, d.duration - (now - e.at)) };
     }
-
-    // ── FRESH JOIN PATH ─────────────────────────────────────────────
-    if (room.players.length >= 15) return socket.emit("error", { msg: "Room is full" });
-    const existing = room.players.find(
-      p => p.name.toLowerCase() === name.toLowerCase() && !p.disconnected
-    );
-    if (existing) return socket.emit("error", { msg: "Name already taken" });
-
-    const token = crypto.randomUUID();
-    const player = {
-      id: socket.id, name, avatar: avatar || null,
-      score: 0, lives: 3, eliminated: false, ready: false,
-      disconnected: false, reconnectToken: token, _disconnectTimer: null
-    };
-    room.players.push(player);
-    socket.join(code);
-    socket.data.roomCode = code;
-    socket.emit("joined", { player, code, reconnectToken: token });
-    broadcastRoom(code, "room_state", getRoomState(room));
-    socket.emit("session_leaderboard", { leaderboard: getSessionLeaderboard() });
+    send(e.ev, d);
   });
+}
 
-  socket.on("player_ready", ({ code }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    const player = room.players.find(p => p.id === socket.id);
-    if (player) { player.ready = !player.ready; broadcastRoom(code, "room_state", getRoomState(room)); }
+function replayToPlayer(room, p) {
+  replayEvents(room, room.replay, (ev, d) => toPlayer(room, p, ev, d));
+  replayEvents(room, room.priv[p.id] || [], (ev, d) => toPlayer(room, p, ev, d));
+}
+
+/* ─── SESSION LEADERBOARD ──────────────────────────────────────────── */
+
+function updateSessionLeaderboard(room) {
+  const top = room.players.reduce((m, p) => Math.max(m, p.score), 0);
+  room.players.forEach(p => {
+    const key = p.name.toLowerCase();
+    if (!room.lb[key]) room.lb[key] = { name: p.name, avatar: p.avatar, totalScore: 0, gamesPlayed: 0, wins: 0 };
+    const e = room.lb[key];
+    e.totalScore += p.score;
+    e.gamesPlayed += 1;
+    e.avatar = p.avatar;
+    if (top > 0 && p.score === top) e.wins += 1;
   });
+}
 
-  socket.on("host_kick", ({ code, playerId }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    const kicked = room.players.find(p => p.id === playerId);
-    if (kicked) {
-      if (kicked._disconnectTimer) clearTimeout(kicked._disconnectTimer);
-      // Invalidate token so they cannot reconnect
-      kicked.reconnectToken = null;
+function getSessionLeaderboard(room) {
+  return Object.values(room.lb).sort((a, b) => b.totalScore - a.totalScore);
+}
+
+/* ─── GAME LIFECYCLE ───────────────────────────────────────────────── */
+
+function prepareGame(room) {
+  const s = room.settings;
+  room.gameState = {};
+  room.total = 0;
+  room.deck = [];
+  switch (room.game) {
+    case "trivial": {
+      const qs = room.questions || TRIVIA;
+      room.deck = shuffle(qs.map((_, i) => i));
+      room.total = Math.min(s.rounds, qs.length);
+      break;
     }
-    room.players = room.players.filter(p => p.id !== playerId);
-    io.to(playerId).emit("kicked");
-    broadcastRoom(code, "room_state", getRoomState(room));
-  });
+    case "wouldyourather":
+      room.deck = shuffle(WOULD_YOU_RATHER.map((_, i) => i));
+      room.total = Math.min(s.rounds, WOULD_YOU_RATHER.length);
+      break;
+    case "fasttyper":
+      room.deck = shuffle(TYPING_PROMPTS.map((_, i) => i));
+      room.total = s.rounds;
+      break;
+    case "wordcrack":
+      room.deck = shuffle(WORDS.map((_, i) => i));
+      room.total = s.rounds;
+      break;
+    case "reaction":
+    case "mathquiz":
+    case "codebreaker":
+      room.total = s.rounds;
+      break;
+  }
+}
 
-  socket.on("host_select_game", ({ code, game, settings }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    room.game = game;
-    room.settings = settings || {};
-    room.phase = "settings";
-    room.players.forEach(p => { p.score = 0; p.lives = 3; p.eliminated = false; p.ready = false; });
-    broadcastRoom(code, "game_selected", { game, settings: room.settings });
-    broadcastRoom(code, "room_state", getRoomState(room));
-  });
-
-  socket.on("host_start_game", ({ code }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    room.phase = "playing";
-    room.round = 1;
-    startGame(code);
-  });
-
-  socket.on("host_next_round", ({ code }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    room.round = (room.round || 1) + 1;
-    startRound(code);
-  });
-
-  socket.on("host_show_leaderboard", ({ code }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    broadcastRoom(code, "show_leaderboard", { players: getSortedPlayers(room) });
-  });
-
-  socket.on("host_show_session_leaderboard", ({ code }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    broadcastRoom(code, "session_leaderboard", { leaderboard: getSessionLeaderboard() });
-  });
-
-  socket.on("host_end_game", ({ code }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    endGame(code);
-  });
-
-  socket.on("host_reset_session_leaderboard", ({ code }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    // Clear all session leaderboard entries
-    Object.keys(sessionLeaderboard).forEach(k => delete sessionLeaderboard[k]);
-    broadcastRoom(code, "session_leaderboard", { leaderboard: [] });
-  });
-
-  socket.on("player_answer", ({ code, answer, time }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    handleAnswer(code, socket.id, answer, time);
-  });
-
-  socket.on("player_tap", ({ code }) => {
-    const room = getRoom(code);
-    if (!room || room.game !== "reaction") return;
-    handleReactionTap(code, socket.id);
-  });
-
-  socket.on("player_emergency", ({ code }) => {
-    const room = getRoom(code);
-    if (!room || room.game !== "imposter") return;
-    const player = room.players.find(p => p.id === socket.id);
-    if (!player || player.eliminated) return;
-    if (room.gameState.emergencyUsed && room.gameState.emergencyUsed[socket.id]) return;
-    if (!room.gameState.emergencyUsed) room.gameState.emergencyUsed = {};
-    room.gameState.emergencyUsed[socket.id] = true;
-    broadcastRoom(code, "emergency_called", { by: player.name });
-    startVoting(code);
-  });
-
-  socket.on("player_vote", ({ code, targetId }) => {
-    const room = getRoom(code);
-    if (!room || room.phase !== "voting") return;
-    const voter = room.players.find(p => p.id === socket.id);
-    if (!voter || voter.eliminated) return;
-    if (room.gameState.votes[socket.id]) return;
-    room.gameState.votes[socket.id] = targetId;
-    broadcastRoom(code, "vote_cast", {
-      voterId: socket.id,
-      totalVotes: Object.keys(room.gameState.votes).length,
-      totalVoters: room.players.filter(p => !p.eliminated && !p.disconnected).length
-    });
-  });
-
-  socket.on("player_shoot", ({ code, spin }) => {
-    const room = getRoom(code);
-    if (!room || room.game !== "roulette") return;
-    handleRoulette(code, socket.id, spin);
-  });
-
-  socket.on("player_guess", ({ code, guess }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    handleGuess(code, socket.id, guess);
-  });
-
-  socket.on("player_typing_done", ({ code, time, accuracy }) => {
-    const room = getRoom(code);
-    if (!room || room.game !== "fasttyper") return;
-    handleTypingDone(code, socket.id, time, accuracy);
-  });
-
-  socket.on("request_session_leaderboard", ({ code }) => {
-    socket.emit("session_leaderboard", { leaderboard: getSessionLeaderboard() });
-  });
-
-  socket.on("request_room_state", ({ code }) => {
-    const room = getRoom(code);
-    if (!room) return;
-    socket.emit("room_state", getRoomState(room));
-  });
-
-  socket.on("disconnect", () => {
-    const code = socket.data.roomCode;
-    if (!code) return;
-    const room = getRoom(code);
-    if (!room) return;
-    const player = room.players.find(p => p.id === socket.id);
-    if (!player) return;
-
-    // Mark as disconnected, start 60s grace window before full removal
-    player.disconnected = true;
-    broadcastRoom(code, "player_disconnected", { id: socket.id, name: player.name });
-    broadcastRoom(code, "room_state", getRoomState(room));
-
-    player._disconnectTimer = setTimeout(() => {
-      const r = getRoom(code);
-      if (!r) return;
-      r.players = r.players.filter(p => p.reconnectToken !== player.reconnectToken);
-      broadcastRoom(code, "room_state", getRoomState(r));
-    }, 60000);
-  });
-});
-
-function startGame(code) {
-  const room = getRoom(code);
-  if (!room) return;
+function startGame(room) {
+  clearAllTimers(room);
+  room.phase = "playing";
   room.round = 1;
-  clearAllTimers(room);
-  broadcastRoom(code, "game_start", { game: room.game, settings: room.settings });
-  setTimeout(() => startRound(code), 1500);
+  room.players.forEach(p => { p.score = 0; p.lives = 3; p.eliminated = false; p.ready = false; });
+  resetReplay(room);
+  prepareGame(room);
+  toRoom(room, "game_start", { game: room.game, settings: publicSettings(room) });
+  toRoom(room, "room_state", getRoomState(room));
+  later(room, () => startRound(room), START_DELAY);
 }
 
-function startRound(code) {
-  const room = getRoom(code);
-  if (!room) return;
-  clearAllTimers(room);
-  const game = room.game;
-
-  if (game === "imposter") startImposterRound(code);
-  else if (game === "trivial") startTrivialRound(code);
-  else if (game === "reaction") startReactionRound(code);
-  else if (game === "wouldyourather") startWouldYouRatherRound(code);
-  else if (game === "mathquiz") startMathRound(code);
-  else if (game === "fasttyper") startFastTyperRound(code);
-  else if (game === "wordcrack") startWordCrackRound(code);
-  else if (game === "codebreaker") startCodeBreakerRound(code);
-  else if (game === "roulette") startRouletteRound(code);
-  else if (game === "rapidfire") startRapidFireRound(code);
+function startRound(room) {
+  if (room.phase !== "playing") return;
+  switch (room.game) {
+    case "imposter": return startImposterRound(room);
+    case "trivial": return startTrivialRound(room);
+    case "reaction": return startReactionRound(room);
+    case "wouldyourather": return startWYRRound(room);
+    case "mathquiz": return startMathRound(room);
+    case "fasttyper": return startTyperRound(room);
+    case "wordcrack": return startGuessRound(room, "wordcrack");
+    case "codebreaker": return startGuessRound(room, "codebreaker");
+    case "roulette": return startRouletteRound(room);
+    case "rapidfire": return startRapidFireRound(room);
+    case "hotpotato": return startPotatoRound(room);
+  }
 }
 
-function startImposterRound(code) {
-  const room = getRoom(code);
-  const activePlayers = room.players.filter(p => !p.eliminated);
-  const numImposters = Math.min(room.settings.imposters || 1, Math.floor(activePlayers.length / 3));
-  const word = getRandomWord();
-  const imposterIds = shuffle(activePlayers.map(p => p.id)).slice(0, numImposters);
+function advance(room, delay) {
+  later(room, () => {
+    if (room.round >= room.total) endGame(room);
+    else { room.round++; startRound(room); }
+  }, delay);
+}
+
+function endGame(room) {
+  if (room.phase !== "playing") return;
+  clearAllTimers(room);
+  room.phase = "ended";
+  room.gameState = {};
+  updateSessionLeaderboard(room);
+  const lb = getSessionLeaderboard(room);
+
+  toRoom(room, "game_over", { players: getSortedPlayers(room), game: room.game });
+  later(room, () => toRoom(room, "session_leaderboard", { leaderboard: lb }), 1000);
+  later(room, () => {
+    if (room.phase !== "ended") return;
+    room.phase = "lobby";
+    room.players = room.players.filter(p => !(p.disconnected && p.gone));
+    room.players.forEach(p => { p.ready = false; });
+    toRoom(room, "room_state", getRoomState(room));
+  }, 6000);
+}
+
+function afterPresenceChange(room) {
+  if (room.phase !== "playing") return;
+  const gs = room.gameState || {};
+  switch (room.game) {
+    case "trivial":
+      if (!gs.revealed && gs.answers && allAnswered(room, gs.answers)) revealTrivial(room);
+      break;
+    case "mathquiz":
+      if (!gs.revealed && gs.answers && allAnswered(room, gs.answers)) revealMath(room);
+      break;
+    case "wouldyourather":
+      if (!gs.revealed && gs.votes && allAnswered(room, gs.votes)) revealWYR(room);
+      break;
+    case "fasttyper":
+      if (!gs.closed && gs.finished && allAnswered(room, gs.finished)) scheduleTyperEnd(room);
+      break;
+    case "imposter":
+      if (gs.phase === "voting" && allAnswered(room, gs.votes)) resolveVoting(room);
+      break;
+    case "roulette": {
+      const p = gs.current && findPlayer(room, gs.current);
+      if (gs.order && gs.current && !gs.busy && (!p || p.disconnected)) {
+        cancel(room, gs.turnTimer);
+        gs.turnTimer = later(room, () => rouletteShoot(room, gs.current, true), 1500);
+      }
+      break;
+    }
+    case "hotpotato":
+      watchHolder(room);
+      break;
+  }
+}
+
+/* ─── IMPOSTER ─────────────────────────────────────────────────────── */
+
+function startImposterRound(room) {
+  resetReplay(room);
+  const active = activePlayers(room);
+  const maxImp = Math.max(1, Math.floor((active.length - 1) / 2));
+  const numImposters = Math.min(room.settings.imposters, maxImp);
+  const word = WORDS[rand(WORDS.length)];
+  const imposterIds = shuffle(active.map(p => p.id)).slice(0, numImposters);
 
   room.gameState = { word, imposterIds, phase: "hint", emergencyUsed: {}, votes: {} };
-  room.phase = "playing";
 
-  activePlayers.forEach(p => {
+  active.forEach(p => {
     const isImposter = imposterIds.includes(p.id);
-    io.to(p.id).emit("imposter_role", { isImposter, word: isImposter ? null : word });
+    priv(room, p, "imposter_role", { isImposter, word: isImposter ? null : word, emergencyAvailable: true });
   });
 
-  broadcastRoom(code, "imposter_round_start", {
+  pub(room, "imposter_round_start", {
     round: room.round,
-    playerCount: activePlayers.length,
-    numImposters
+    playerCount: active.length,
+    numImposters,
+    active: active.map(p => p.id)
   });
 }
 
-function startVoting(code) {
-  const room = getRoom(code);
-  room.phase = "voting";
-  room.gameState.votes = {};
-  const duration = (room.settings.votingTime || 30) * 1000;
-
-  broadcastRoom(code, "voting_start", {
+function startVoting(room) {
+  const gs = room.gameState;
+  if (gs.phase !== "hint") return;
+  gs.phase = "voting";
+  gs.votes = {};
+  const duration = room.settings.votingTime * 1000;
+  pub(room, "voting_start", {
     duration,
-    players: room.players.filter(p => !p.eliminated).map(p => ({ id: p.id, name: p.name, avatar: p.avatar }))
+    players: activePlayers(room).map(p => ({ id: p.id, name: p.name, avatar: p.avatar }))
   });
-
-  room.timers.voting = setTimeout(() => resolveVoting(code), duration);
+  gs.voteTimer = later(room, () => resolveVoting(room), duration);
 }
 
-function resolveVoting(code) {
-  const room = getRoom(code);
-  if (!room) return;
-  const votes = room.gameState.votes;
+function resolveVoting(room) {
+  const gs = room.gameState;
+  if (!gs || gs.phase !== "voting") return;
+  gs.phase = "resolving";
+  cancel(room, gs.voteTimer);
+
   const tally = {};
-  Object.values(votes).forEach(id => { tally[id] = (tally[id] || 0) + 1; });
+  Object.values(gs.votes).forEach(id => { tally[id] = (tally[id] || 0) + 1; });
+  const max = Math.max(0, ...Object.values(tally));
+  const top = Object.keys(tally).filter(id => tally[id] === max);
+  const tie = top.length > 1;
+  const eliminatedId = max > 0 && !tie ? top[0] : null;
+  const out = eliminatedId ? findPlayer(room, eliminatedId) : null;
+  if (out) out.eliminated = true;
 
-  let maxVotes = 0, eliminated = null;
-  Object.entries(tally).forEach(([id, count]) => {
-    if (count > maxVotes) { maxVotes = count; eliminated = id; }
-  });
+  const imps = gs.imposterIds;
+  const impAlive = imps.filter(id => { const p = findPlayer(room, id); return p && !p.eliminated; });
+  const crewAlive = activePlayers(room).filter(p => !imps.includes(p.id));
+  const crewWon = impAlive.length === 0;
+  const gameOver = crewWon || crewAlive.length <= impAlive.length;
 
-  const eliminatedPlayer = room.players.find(p => p.id === eliminated);
-  if (eliminatedPlayer) eliminatedPlayer.eliminated = true;
-
-  const isImposter = eliminated && room.gameState.imposterIds.includes(eliminated);
-  const allImpostersGone = room.gameState.imposterIds.every(id => room.players.find(p => p.id === id)?.eliminated);
-  const activePlayers = room.players.filter(p => !p.eliminated);
-  const activeImposters = room.gameState.imposterIds.filter(id => !room.players.find(p => p.id === id)?.eliminated);
-  const gameOver = allImpostersGone || activePlayers.length <= activeImposters.length;
-
-  broadcastRoom(code, "voting_result", {
+  pub(room, "voting_result", {
     tally,
-    eliminatedId: eliminated,
-    eliminatedName: eliminatedPlayer?.name,
-    wasImposter: isImposter,
+    eliminatedId: out ? out.id : null,
+    eliminatedName: out ? out.name : null,
+    wasImposter: out ? imps.includes(out.id) : false,
+    tie,
+    noVotes: max === 0,
     gameOver,
-    word: room.gameState.word,
-    imposterIds: room.gameState.imposterIds,
-    imposterNames: room.gameState.imposterIds.map(id => room.players.find(p => p.id === id)?.name)
+    crewWon,
+    word: gs.word,
+    imposterIds: imps,
+    imposterNames: imps.map(id => (findPlayer(room, id) || {}).name).filter(Boolean)
   });
 
   if (gameOver) {
-    room.phase = "results";
-    if (allImpostersGone) room.players.filter(p => !room.gameState.imposterIds.includes(p.id)).forEach(p => p.score += 100);
-    else room.gameState.imposterIds.forEach(id => { const p = room.players.find(x => x.id === id); if (p) p.score += 150; });
-    setTimeout(() => endGame(code), 5000);
+    if (crewWon) room.players.filter(p => !imps.includes(p.id)).forEach(p => { p.score += 100; });
+    else imps.forEach(id => { const p = findPlayer(room, id); if (p) p.score += 150; });
+    later(room, () => endGame(room), 5000);
   } else {
-    room.phase = "playing";
-    setTimeout(() => startImposterRound(code), 5000);
+    later(room, () => { room.round++; startImposterRound(room); }, 5000);
   }
 }
 
-function startTrivialRound(code) {
-  const room = getRoom(code);
-  const questions = room.settings.questions || TRIVIA;
-  const idx = (room.round - 1) % questions.length;
-  const q = questions[idx];
-  room.gameState = { question: q, answers: {}, revealed: false };
-  const duration = (room.settings.questionTime || 20) * 1000;
+/* ─── TRIVIAL ──────────────────────────────────────────────────────── */
 
-  broadcastRoom(code, "trivial_question", {
-    round: room.round,
-    total: room.settings.rounds || questions.length,
-    question: q.q,
-    options: q.options,
-    type: q.type,
-    duration
-  });
-
-  room.timers.question = setTimeout(() => revealTrivialAnswer(code), duration);
-}
-
-function revealTrivialAnswer(code) {
-  const room = getRoom(code);
-  if (!room || room.game !== "trivial") return;
-  const q = room.gameState.question;
-  const answers = room.gameState.answers;
-
-  room.players.forEach(p => {
-    if (answers[p.id] === q.answer) p.score += 100;
-  });
-
-  broadcastRoom(code, "trivial_reveal", {
-    correctIndex: q.answer,
-    answers,
-    players: getSortedPlayers(room)
-  });
-
-  const totalRounds = room.settings.rounds || 10;
-  if (room.round >= totalRounds) {
-    setTimeout(() => endGame(code), 4000);
-  } else {
-    setTimeout(() => { room.round++; startRound(code); }, 4000);
+function startTrivialRound(room) {
+  resetReplay(room);
+  const qs = room.questions || TRIVIA;
+  const src = qs[room.deck[(room.round - 1) % room.deck.length]];
+  let options = src.options.slice();
+  let answer = src.answer;
+  if (src.type !== "tf") {
+    const idx = shuffle(options.map((_, i) => i));
+    options = idx.map(i => src.options[i]);
+    answer = idx.indexOf(src.answer);
   }
+  const duration = room.settings.questionTime * 1000;
+  const gs = { question: { q: src.q, options, answer, type: src.type }, answers: {}, revealed: false };
+  room.gameState = gs;
+
+  pub(room, "trivial_question", {
+    round: room.round, total: room.total, question: src.q, options, type: src.type, duration
+  });
+  gs.timer = later(room, () => revealTrivial(room), duration);
 }
 
-function startReactionRound(code) {
-  const room = getRoom(code);
-  const activePlayers = room.players.filter(p => !p.eliminated);
-  room.gameState = { tapped: {}, flashActive: false, roundOver: false };
-  room.phase = "playing";
-
-  broadcastRoom(code, "reaction_waiting", { round: room.round, players: activePlayers.map(p => ({ id: p.id, name: p.name })) });
-
-  const delay = 2000 + Math.random() * 6000;
-  room.timers.flash = setTimeout(() => triggerFlash(code), delay);
+function revealTrivial(room) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs || gs.revealed) return;
+  gs.revealed = true;
+  cancel(room, gs.timer);
+  room.players.forEach(p => { if (gs.answers[p.id] === gs.question.answer) p.score += 100; });
+  pub(room, "trivial_reveal", { correctIndex: gs.question.answer, answers: gs.answers, players: getSortedPlayers(room) });
+  advance(room, 4000);
 }
 
-function triggerFlash(code) {
-  const room = getRoom(code);
-  if (!room) return;
-  room.gameState.flashActive = true;
-  room.gameState.flashTime = Date.now();
-  broadcastRoom(code, "reaction_flash");
+/* ─── REACTION ─────────────────────────────────────────────────────── */
 
-  room.timers.flashEnd = setTimeout(() => {
-    room.gameState.flashActive = false;
-    const activePlayers = room.players.filter(p => !p.eliminated);
-    const missed = activePlayers.filter(p => !room.gameState.tapped[p.id]);
-    missed.forEach(p => { p.eliminated = true; });
+function startReactionRound(room) {
+  resetReplay(room);
+  const active = activePlayers(room);
+  const gs = { tapped: {}, flashActive: false };
+  room.gameState = gs;
 
-    broadcastRoom(code, "reaction_result", {
-      survived: activePlayers.filter(p => room.gameState.tapped[p.id]).map(p => p.id),
-      eliminated: missed.map(p => ({ id: p.id, name: p.name })),
+  pub(room, "reaction_waiting", { round: room.round, players: active.map(p => ({ id: p.id, name: p.name })) });
+  gs.flashTimer = later(room, () => triggerFlash(room), 2000 + Math.random() * 6000);
+}
+
+function triggerFlash(room) {
+  const gs = room.gameState;
+  gs.flashActive = true;
+  toRoom(room, "reaction_flash");
+
+  later(room, () => {
+    gs.flashActive = false;
+    const active = activePlayers(room);
+    const missed = active.filter(p => !gs.tapped[p.id]);
+    const mode = room.settings.mode;
+    let out = [];
+    if (mode === "laststanding" && missed.length < active.length) {
+      out = missed;
+      out.forEach(p => { p.eliminated = true; });
+    }
+
+    pub(room, "reaction_result", {
+      survived: active.filter(p => !p.eliminated).map(p => p.id),
+      eliminated: out.map(p => ({ id: p.id, name: p.name })),
       players: getSortedPlayers(room)
     });
 
-    const remaining = room.players.filter(p => !p.eliminated);
-    const totalRounds = room.settings.rounds || 5;
-
-    if (remaining.length <= 1 || room.round >= totalRounds) {
-      // Award winner points in laststanding mode
-      if (room.settings.mode !== "mosttaps" && remaining.length === 1) {
-        remaining[0].score += 100 * room.round;
-      }
-      setTimeout(() => endGame(code), 3000);
+    const remaining = activePlayers(room);
+    const lastRound = room.round >= room.total;
+    if (mode === "laststanding" && (remaining.length <= 1 || lastRound)) {
+      remaining.forEach(p => { p.score += 100 * room.round; });
+      later(room, () => endGame(room), 3000);
+    } else if (lastRound) {
+      later(room, () => endGame(room), 3000);
     } else {
-      setTimeout(() => { room.round++; startRound(code); }, 3000);
+      advance(room, 3000);
     }
   }, 1500);
 }
 
-function handleReactionTap(code, playerId) {
-  const room = getRoom(code);
-  if (!room || !room.gameState.flashActive) return;
-  room.gameState.tapped[playerId] = true;
-  const player = room.players.find(p => p.id === playerId);
-  if (room.settings.mode === "mosttaps") { if (player) player.score += 10; }
-  io.to(playerId).emit("reaction_tapped", { success: true });
+function handleReactionTap(room, p) {
+  const gs = room.gameState;
+  if (!gs || !gs.flashActive || p.eliminated || gs.tapped[p.id]) return;
+  gs.tapped[p.id] = true;
+  if (room.settings.mode === "mosttaps") p.score += 10;
+  toPlayer(room, p, "reaction_tapped", { success: true });
 }
 
-function startWouldYouRatherRound(code) {
-  const room = getRoom(code);
-  const q = WOULD_YOU_RATHER[Math.floor(Math.random() * WOULD_YOU_RATHER.length)];
-  room.gameState = { question: q, votes: {}, revealed: false };
+/* ─── WOULD YOU RATHER ─────────────────────────────────────────────── */
 
-  broadcastRoom(code, "wyr_question", {
-    round: room.round,
-    total: room.settings.rounds || 10,
-    optionA: q[0],
-    optionB: q[1]
-  });
+function startWYRRound(room) {
+  resetReplay(room);
+  const q = WOULD_YOU_RATHER[room.deck[(room.round - 1) % room.deck.length]];
+  const duration = 30000;
+  const gs = { question: q, votes: {}, revealed: false };
+  room.gameState = gs;
 
-  room.timers.question = setTimeout(() => revealWYR(code), 30000);
+  pub(room, "wyr_question", { round: room.round, total: room.total, optionA: q[0], optionB: q[1], duration });
+  gs.timer = later(room, () => revealWYR(room), duration);
 }
 
-function revealWYR(code) {
-  const room = getRoom(code);
-  if (!room) return;
-  const votes = room.gameState.votes;
+function revealWYR(room) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs || gs.revealed) return;
+  gs.revealed = true;
+  cancel(room, gs.timer);
+
   let aVotes = 0, bVotes = 0;
-  Object.values(votes).forEach(v => { if (v === 0) aVotes++; else bVotes++; });
-
+  Object.values(gs.votes).forEach(v => { if (v === 0) aVotes++; else bVotes++; });
   const minority = aVotes < bVotes ? 0 : bVotes < aVotes ? 1 : -1;
   room.players.forEach(p => {
-    if (!votes.hasOwnProperty(p.id)) return; // didn't vote — no change
-    if (minority === -1) return;              // tie — no penalty/reward
-    if (votes[p.id] === minority) {
-      p.score -= 10; // minority loses
-    } else {
-      p.score += 20; // majority wins
-    }
+    if (gs.votes[p.id] === undefined || minority === -1) return;
+    p.score += gs.votes[p.id] === minority ? -10 : 20;
   });
 
-  broadcastRoom(code, "wyr_reveal", {
-    aVotes, bVotes,
-    minority,
-    players: getSortedPlayers(room)
-  });
-
-  clearTimeout(room.timers.question);
-  const totalRounds = room.settings.rounds || 10;
-  if (room.round >= totalRounds) {
-    setTimeout(() => endGame(code), 4000);
-  } else {
-    setTimeout(() => { room.round++; startRound(code); }, 4000);
-  }
+  pub(room, "wyr_reveal", { aVotes, bVotes, minority, players: getSortedPlayers(room) });
+  advance(room, 4000);
 }
 
-function startMathRound(code) {
-  const room = getRoom(code);
-  const q = generateMathQuestion(room.settings.difficulty || "medium");
-  room.gameState = { question: q, answers: {}, startTime: Date.now() };
-  const duration = (room.settings.questionTime || 15) * 1000;
+/* ─── MATH QUIZ ────────────────────────────────────────────────────── */
 
-  broadcastRoom(code, "math_question", {
-    round: room.round,
-    total: room.settings.rounds || 10,
-    question: q.question,
-    options: q.options,
-    duration
-  });
+function startMathRound(room) {
+  resetReplay(room);
+  const q = generateMathQuestion(room.settings.difficulty);
+  const duration = room.settings.questionTime * 1000;
+  const gs = { question: q, answers: {}, startTime: Date.now(), duration, revealed: false };
+  room.gameState = gs;
 
-  room.timers.question = setTimeout(() => revealMathAnswer(code), duration);
+  pub(room, "math_question", { round: room.round, total: room.total, question: q.question, options: q.options, duration });
+  gs.timer = later(room, () => revealMath(room), duration);
 }
 
-function revealMathAnswer(code) {
-  const room = getRoom(code);
-  if (!room) return;
-  const q = room.gameState.question;
-  const answers = room.gameState.answers;
-  const duration = (room.settings.questionTime || 15) * 1000;
+function revealMath(room) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs || gs.revealed) return;
+  gs.revealed = true;
+  cancel(room, gs.timer);
 
   room.players.forEach(p => {
-    const ans = answers[p.id];
-    if (ans && ans.answer === q.answer) {
-      const timeBonus = Math.max(0, Math.floor((duration - (ans.time - room.gameState.startTime)) / 100));
-      p.score += 100 + timeBonus;
+    const a = gs.answers[p.id];
+    if (a && a.answer === gs.question.answer) {
+      const bonus = Math.max(0, Math.floor((gs.duration - (a.at - gs.startTime)) / 100));
+      p.score += 100 + bonus;
     }
   });
 
-  broadcastRoom(code, "math_reveal", {
-    correctIndex: q.answer,
-    answers: Object.fromEntries(Object.entries(answers).map(([id, a]) => [id, a.answer])),
+  pub(room, "math_reveal", {
+    correctIndex: gs.question.answer,
+    answers: Object.fromEntries(Object.entries(gs.answers).map(([id, a]) => [id, a.answer])),
     players: getSortedPlayers(room)
   });
+  advance(room, 4000);
+}
 
-  clearTimeout(room.timers.question);
-  const totalRounds = room.settings.rounds || 10;
-  if (room.round >= totalRounds) {
-    setTimeout(() => endGame(code), 4000);
+/* ─── FAST TYPER ───────────────────────────────────────────────────── */
+
+const FASTTYPER_TIMEOUT = 90 * 1000;
+
+function startTyperRound(room) {
+  resetReplay(room);
+  const prompt = TYPING_PROMPTS[room.deck[(room.round - 1) % room.deck.length]];
+  const gs = { prompt, finished: {}, startTime: Date.now(), closed: false };
+  room.gameState = gs;
+
+  pub(room, "typing_round", { round: room.round, total: room.total, prompt, duration: FASTTYPER_TIMEOUT });
+  gs.timer = later(room, () => endTyperRound(room), FASTTYPER_TIMEOUT);
+}
+
+function scheduleTyperEnd(room) {
+  const gs = room.gameState;
+  if (gs.endScheduled) return;
+  gs.endScheduled = true;
+  later(room, () => endTyperRound(room), 1000);
+}
+
+function endTyperRound(room) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs || gs.closed) return;
+  gs.closed = true;
+  cancel(room, gs.timer);
+  pub(room, "typing_round_end", { players: getSortedPlayers(room) });
+  advance(room, 3000);
+}
+
+function handleTypingDone(room, p, data) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs || gs.closed || p.eliminated || gs.finished[p.id]) return;
+  if (typeof data.text !== "string" || data.text !== gs.prompt) return;
+
+  const elapsed = Date.now() - gs.startTime;
+  if (elapsed < gs.prompt.length * 40) return;
+
+  const errors = Math.min(500, Math.max(0, parseInt(data.errors, 10) || 0));
+  const len = gs.prompt.length;
+  const accuracy = Math.round((len / (len + errors)) * 100);
+  const timeBonus = Math.round(500 * Math.max(0, 1 - elapsed / 45000));
+  p.score += timeBonus + accuracy * 2;
+  gs.finished[p.id] = { time: elapsed, accuracy };
+
+  pub(room, "typing_player_done", {
+    playerId: p.id, name: p.name, position: Object.keys(gs.finished).length,
+    time: elapsed, accuracy, players: getSortedPlayers(room)
+  });
+  if (allAnswered(room, gs.finished)) scheduleTyperEnd(room);
+}
+
+/* ─── WORD CRACK AND CODE BREAKER ──────────────────────────────────── */
+
+const GUESS_KINDS = {
+  wordcrack: { round: "wordcrack_round", result: "wordcrack_result", grid: "wordcrack_grid_update", solved: "wordcrack_solved", timeout: "wordcrack_timeout", ms: 90000, key: "word" },
+  codebreaker: { round: "codebreaker_round", result: "codebreaker_result", grid: "codebreaker_grid_update", solved: "codebreaker_solved", timeout: "codebreaker_timeout", ms: 90000, key: "code" }
+};
+
+function startGuessRound(room, kind) {
+  resetReplay(room);
+  const k = GUESS_KINDS[kind];
+  let secret;
+  const payload = { round: room.round, total: room.total, duration: k.ms };
+  if (kind === "wordcrack") {
+    secret = WORDS[room.deck[(room.round - 1) % room.deck.length]];
+    payload.wordLength = secret.length;
   } else {
-    setTimeout(() => { room.round++; startRound(code); }, 4000);
+    secret = Array.from({ length: 4 }, () => rand(10)).join("");
   }
+  const gs = { secret, grids: {}, solved: false, closed: false };
+  room.gameState = gs;
+
+  pub(room, k.round, payload);
+  gs.timer = later(room, () => {
+    if (gs.solved || gs.closed) return;
+    gs.closed = true;
+    pub(room, k.timeout, { [k.key]: gs.secret });
+    advance(room, 4000);
+  }, k.ms);
 }
 
-// ─── FAST TYPER — with timeout ────────────────────────────────────────
-const FASTTYPER_TIMEOUT = 120 * 1000; // 2 minutes max per round
+function handleGuess(room, p, guess) {
+  const kind = room.game;
+  const k = GUESS_KINDS[kind];
+  const gs = room.gameState;
+  if (!k || room.phase !== "playing" || !gs || !gs.secret || gs.solved || gs.closed || p.eliminated) return;
+  if (typeof guess !== "string") return;
 
-function startFastTyperRound(code) {
-  const room = getRoom(code);
-  const prompt = TYPING_PROMPTS[Math.floor(Math.random() * TYPING_PROMPTS.length)];
-  room.gameState = { prompt, finished: {}, startTime: Date.now() };
-
-  broadcastRoom(code, "typing_round", {
-    round: room.round,
-    total: room.settings.rounds || 5,
-    prompt
-  });
-
-  // Timeout — force end if players don't finish
-  room.timers.typingTimeout = setTimeout(() => {
-    const r = getRoom(code);
-    if (!r || r.game !== "fasttyper") return;
-    broadcastRoom(code, "typing_round_end", { players: getSortedPlayers(r) });
-    const totalRounds = r.settings.rounds || 5;
-    if (r.round >= totalRounds) setTimeout(() => endGame(code), 3000);
-    else setTimeout(() => { r.round++; startRound(code); }, 3000);
-  }, FASTTYPER_TIMEOUT);
-}
-
-function handleTypingDone(code, playerId, time, accuracy) {
-  const room = getRoom(code);
-  if (!room || room.gameState.finished[playerId]) return;
-  room.gameState.finished[playerId] = { time, accuracy };
-  const player = room.players.find(p => p.id === playerId);
-  const position = Object.keys(room.gameState.finished).length;
-  const timeBonus = Math.max(0, 500 - Math.floor(time / 10));
-  const accBonus = Math.floor(accuracy * 2);
-  if (player) player.score += timeBonus + accBonus;
-
-  broadcastRoom(code, "typing_player_done", {
-    playerId,
-    name: player?.name,
-    position,
-    time,
-    accuracy,
-    players: getSortedPlayers(room)
-  });
-
-  const activePlayers = room.players.filter(p => !p.eliminated && !p.disconnected);
-  if (Object.keys(room.gameState.finished).length >= activePlayers.length) {
-    clearTimeout(room.timers.typingTimeout);
-    setTimeout(() => {
-      broadcastRoom(code, "typing_round_end", { players: getSortedPlayers(room) });
-      const totalRounds = room.settings.rounds || 5;
-      if (room.round >= totalRounds) setTimeout(() => endGame(code), 3000);
-      else setTimeout(() => { room.round++; startRound(code); }, 3000);
-    }, 1000);
-  }
-}
-
-// ─── WORD CRACK — with timeout ────────────────────────────────────────
-const WORDCRACK_TIMEOUT = 90 * 1000; // 90 seconds max per round
-
-function startWordCrackRound(code) {
-  const room = getRoom(code);
-  const word = getRandomWord();
-  room.gameState = { word, grids: {}, solved: false };
-
-  broadcastRoom(code, "wordcrack_round", {
-    round: room.round,
-    total: room.settings.rounds || 5,
-    wordLength: word.length
-  });
-
-  // Timeout — reveal word and move on if nobody solves it
-  room.timers.wordTimeout = setTimeout(() => {
-    const r = getRoom(code);
-    if (!r || r.game !== "wordcrack" || r.gameState.solved) return;
-    broadcastRoom(code, "wordcrack_timeout", { word: r.gameState.word });
-    const totalRounds = r.settings.rounds || 5;
-    if (r.round >= totalRounds) setTimeout(() => endGame(code), 4000);
-    else setTimeout(() => { r.round++; startRound(code); }, 4000);
-  }, WORDCRACK_TIMEOUT);
-}
-
-// ─── CODE BREAKER — with timeout ─────────────────────────────────────
-const CODEBREAKER_TIMEOUT = 90 * 1000; // 90 seconds max per round
-
-function startCodeBreakerRound(code) {
-  const room = getRoom(code);
-  const digits = Array.from({ length: 4 }, () => Math.floor(Math.random() * 10)).join("");
-  room.gameState = { code: digits, grids: {}, solved: false };
-
-  broadcastRoom(code, "codebreaker_round", {
-    round: room.round,
-    total: room.settings.rounds || 5
-  });
-
-  // Timeout — reveal code and move on if nobody cracks it
-  room.timers.codeTimeout = setTimeout(() => {
-    const r = getRoom(code);
-    if (!r || r.game !== "codebreaker" || r.gameState.solved) return;
-    broadcastRoom(code, "codebreaker_timeout", { code: r.gameState.code });
-    const totalRounds = r.settings.rounds || 5;
-    if (r.round >= totalRounds) setTimeout(() => endGame(code), 4000);
-    else setTimeout(() => { r.round++; startRound(code); }, 4000);
-  }, CODEBREAKER_TIMEOUT);
-}
-
-function handleGuess(code, playerId, guess) {
-  const room = getRoom(code);
-  if (!room) return;
-
-  if (room.game === "wordcrack") {
-    const word = room.gameState.word;
-    const g = guess.toUpperCase().slice(0, word.length);
-    const result = getWordCrackResult(word, g);
-    const isCorrect = g === word;
-
-    if (!room.gameState.grids[playerId]) room.gameState.grids[playerId] = [];
-    room.gameState.grids[playerId].push({ guess: g, result });
-
-    io.to(playerId).emit("wordcrack_result", { guess: g, result, correct: isCorrect });
-    broadcastRoom(code, "wordcrack_grid_update", { playerId, grids: room.gameState.grids });
-
-    if (isCorrect && !room.gameState.solved) {
-      room.gameState.solved = true;
-      clearTimeout(room.timers.wordTimeout);
-      const player = room.players.find(p => p.id === playerId);
-      if (player) player.score += 200;
-      broadcastRoom(code, "wordcrack_solved", { playerId, name: player?.name, word, players: getSortedPlayers(room) });
-      const totalRounds = room.settings.rounds || 5;
-      if (room.round >= totalRounds) setTimeout(() => endGame(code), 4000);
-      else setTimeout(() => { room.round++; startRound(code); }, 4000);
+  let g;
+  if (kind === "wordcrack") {
+    g = guess.trim().toUpperCase();
+    if (!/^[A-Z]+$/.test(g) || g.length !== gs.secret.length) {
+      return toPlayer(room, p, "guess_rejected", { msg: `Word must be ${gs.secret.length} letters` });
     }
-  } else if (room.game === "codebreaker") {
-    const code_ = room.gameState.code;
-    const g = guess.toString().padStart(4, "0").slice(0, 4);
-    const result = getCodeBreakerResult(code_, g);
-    const isCorrect = g === code_;
+  } else {
+    g = guess.trim();
+    if (!/^\d{4}$/.test(g)) return toPlayer(room, p, "guess_rejected", { msg: "Enter 4 digits" });
+  }
 
-    if (!room.gameState.grids[playerId]) room.gameState.grids[playerId] = [];
-    room.gameState.grids[playerId].push({ guess: g, result });
+  const list = gs.grids[p.id] = gs.grids[p.id] || [];
+  if (list.length >= 30) return toPlayer(room, p, "guess_rejected", { msg: "No guesses left" });
 
-    io.to(playerId).emit("codebreaker_result", { guess: g, result, correct: isCorrect });
-    broadcastRoom(code, "codebreaker_grid_update", { playerId, grids: room.gameState.grids });
+  const result = guessResult(gs.secret, g);
+  const correct = g === gs.secret;
+  list.push({ guess: g, result });
 
-    if (isCorrect && !room.gameState.solved) {
-      room.gameState.solved = true;
-      clearTimeout(room.timers.codeTimeout);
-      const player = room.players.find(p => p.id === playerId);
-      if (player) player.score += 200;
-      broadcastRoom(code, "codebreaker_solved", { playerId, name: player?.name, code: code_, players: getSortedPlayers(room) });
-      const totalRounds = room.settings.rounds || 5;
-      if (room.round >= totalRounds) setTimeout(() => endGame(code), 4000);
-      else setTimeout(() => { room.round++; startRound(code); }, 4000);
-    }
+  toPlayer(room, p, k.result, { guess: g, result, correct });
+  toDisplay(room, k.grid, { playerId: p.id, grids: gs.grids });
+
+  if (correct) {
+    gs.solved = true;
+    cancel(room, gs.timer);
+    p.score += 200;
+    pub(room, k.solved, { playerId: p.id, name: p.name, [k.key]: gs.secret, players: getSortedPlayers(room) });
+    advance(room, 4000);
   }
 }
 
-function getWordCrackResult(word, guess) {
+function guessResult(word, guess) {
   const result = Array(word.length).fill("absent");
-  const wordArr = word.split("");
-  const guessArr = guess.split("");
   const used = Array(word.length).fill(false);
-
-  guessArr.forEach((c, i) => { if (c === wordArr[i]) { result[i] = "correct"; used[i] = true; } });
-  guessArr.forEach((c, i) => {
-    if (result[i] === "correct") return;
-    const j = wordArr.findIndex((w, wi) => w === c && !used[wi]);
+  for (let i = 0; i < guess.length; i++) {
+    if (guess[i] === word[i]) { result[i] = "correct"; used[i] = true; }
+  }
+  for (let i = 0; i < guess.length; i++) {
+    if (result[i] === "correct") continue;
+    const j = [...word].findIndex((w, wi) => w === guess[i] && !used[wi]);
     if (j !== -1) { result[i] = "present"; used[j] = true; }
-  });
+  }
   return result;
 }
 
-function getCodeBreakerResult(code, guess) {
-  return getWordCrackResult(code, guess);
-}
+/* ─── ROULETTE ─────────────────────────────────────────────────────── */
 
-function startRouletteRound(code) {
-  const room = getRoom(code);
-  const activePlayers = room.players.filter(p => !p.eliminated);
-  const order = shuffle(activePlayers.map(p => p.id));
-  room.gameState = { chamber: Math.floor(Math.random() * 6), currentShot: 0, order, currentIdx: 0, spinsUsed: {} };
-  room.phase = "playing";
+const ROULETTE_TURN_MS = 20000;
 
-  broadcastRoom(code, "roulette_round", {
+function startRouletteRound(room) {
+  resetReplay(room);
+  const order = shuffle(activePlayers(room).map(p => p.id));
+  if (order.length < 2) return endGame(room);
+  const gs = {
+    order, idx: 0, chamber: rand(6), shot: 0, spun: false, busy: false, current: null, turnTimer: null
+  };
+  room.gameState = gs;
+
+  pub(room, "roulette_round", {
     round: room.round,
-    order: order.map(id => ({ id, name: room.players.find(p => p.id === id)?.name })),
+    order: order.map(id => ({ id, name: (findPlayer(room, id) || {}).name })),
     currentPlayer: order[0]
   });
-
-  io.to(order[0]).emit("your_turn", { game: "roulette" });
+  beginRouletteTurn(room);
 }
 
-function handleRoulette(code, playerId, spin) {
-  const room = getRoom(code);
-  if (!room) return;
+function beginRouletteTurn(room) {
   const gs = room.gameState;
-  if (gs.order[gs.currentIdx] !== playerId) return;
+  if (room.phase !== "playing" || !gs.order) return;
+  gs.order = gs.order.filter(id => { const p = findPlayer(room, id); return p && !p.eliminated; });
+  if (gs.order.length <= 1) return finishRoulette(room);
 
-  if (spin) {
-    if (gs.spinsUsed[playerId]) {
-      io.to(playerId).emit("roulette_spin_denied", { msg: "You already spun this turn" });
-      return;
-    }
-    gs.spinsUsed[playerId] = true;
-    gs.chamber = Math.floor(Math.random() * 6);
-    gs.currentShot = 0;
-    broadcastRoom(code, "roulette_spin", { playerId });
-    setTimeout(() => io.to(playerId).emit("roulette_spin_done"), 2000);
-    return;
-  }
+  gs.idx = gs.idx % gs.order.length;
+  const p = findPlayer(room, gs.order[gs.idx]);
+  gs.current = p.id;
+  gs.spun = false;
+  gs.busy = false;
+  room.priv = {};
 
-  const bang = gs.currentShot === gs.chamber;
-  gs.currentShot++;
+  pub(room, "roulette_next", { currentPlayer: p.id, name: p.name, duration: ROULETTE_TURN_MS }, true);
+  priv(room, p, "your_turn", { game: "roulette", duration: ROULETTE_TURN_MS });
+  const wait = p.disconnected ? 1500 : ROULETTE_TURN_MS;
+  gs.turnTimer = later(room, () => rouletteShoot(room, p.id, true), wait);
+}
+
+function finishRoulette(room) {
+  const gs = room.gameState;
+  gs.busy = true;
+  const winner = activePlayers(room)[0];
+  if (winner) winner.score += room.settings.mode === "mostrounds" ? 100 : 300;
+  later(room, () => endGame(room), 3000);
+}
+
+function rouletteSpin(room, p) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs.order || gs.current !== p.id || gs.busy) return;
+  if (gs.spun) return toPlayer(room, p, "roulette_spin_denied", { msg: "You already spun this turn" });
+  gs.spun = true;
+  gs.busy = true;
+  gs.chamber = rand(6);
+  gs.shot = 0;
+  cancel(room, gs.turnTimer);
+  toRoom(room, "roulette_spin", { playerId: p.id });
+  later(room, () => {
+    gs.busy = false;
+    toPlayer(room, p, "roulette_spin_done");
+    gs.turnTimer = later(room, () => rouletteShoot(room, p.id, true), ROULETTE_TURN_MS);
+  }, 2000);
+}
+
+function rouletteShoot(room, playerId, auto) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs.order || gs.current !== playerId || gs.busy) return;
+  gs.busy = true;
+  cancel(room, gs.turnTimer);
+  const p = findPlayer(room, playerId);
+  const bang = gs.shot === gs.chamber;
+  gs.shot++;
+  room.priv = {};
 
   if (bang) {
-    const player = room.players.find(p => p.id === playerId);
-    if (player) player.eliminated = true;
-    broadcastRoom(code, "roulette_bang", { playerId, name: player?.name });
-
-    const remaining = room.players.filter(p => !p.eliminated);
-
-    if (remaining.length <= 1) {
-      if (remaining[0]) remaining[0].score += 300;
-      setTimeout(() => endGame(code), 3000);
-    } else {
-      gs.chamber = Math.floor(Math.random() * 6);
-      gs.currentShot = 0;
-      gs.order = gs.order.filter(id => id !== playerId);
-      gs.currentIdx = gs.currentIdx % gs.order.length;
-      setTimeout(() => nextRoulettePlayer(code), 3000);
-    }
+    if (p) p.eliminated = true;
+    pub(room, "roulette_bang", { playerId, name: p ? p.name : "", auto: !!auto }, true);
+    gs.chamber = rand(6);
+    gs.shot = 0;
+    gs.order = gs.order.filter(id => id !== playerId);
+    if (activePlayers(room).length <= 1) finishRoulette(room);
+    else later(room, () => beginRouletteTurn(room), 3000);
   } else {
-    broadcastRoom(code, "roulette_safe", { playerId });
-    gs.currentIdx = (gs.currentIdx + 1) % gs.order.length;
-    while (room.players.find(p => p.id === gs.order[gs.currentIdx])?.eliminated) {
-      gs.currentIdx = (gs.currentIdx + 1) % gs.order.length;
-    }
-    setTimeout(() => nextRoulettePlayer(code), 2000);
+    if (p && room.settings.mode === "mostrounds") p.score += 50;
+    toRoom(room, "roulette_safe", { playerId, auto: !!auto });
+    gs.idx = (gs.idx + 1) % gs.order.length;
+    later(room, () => beginRouletteTurn(room), 2000);
   }
 }
 
-function nextRoulettePlayer(code) {
-  const room = getRoom(code);
-  if (!room) return;
+/* ─── RAPID FIRE ───────────────────────────────────────────────────── */
+
+function startRapidFireRound(room) {
+  resetReplay(room);
+  const duration = room.settings.duration * 1000;
+  const gs = { questions: shuffle(RAPID_FIRE), currentQ: 0, qi: 0, answers: {}, ended: false };
+  room.gameState = gs;
+
+  const first = gs.questions[0];
+  pub(room, "rapidfire_start", { duration, question: { q: first.q, options: first.options }, qi: 0 });
+  gs.timer = later(room, () => endRapidFire(room), duration);
+  gs.qTimer = later(room, () => nextRapidFireQuestion(room), 5000);
+}
+
+function nextRapidFireQuestion(room) {
   const gs = room.gameState;
-  const nextId = gs.order[gs.currentIdx];
-  broadcastRoom(code, "roulette_next", { currentPlayer: nextId, name: room.players.find(p => p.id === nextId)?.name });
-  io.to(nextId).emit("your_turn", { game: "roulette" });
-}
-
-function startRapidFireRound(code) {
-  const room = getRoom(code);
-  const duration = (room.settings.duration || 60) * 1000;
-  room.gameState = { questions: shuffle([...RAPID_FIRE]), currentQ: 0, answers: {}, startTime: Date.now() };
-
-  const firstQ = room.gameState.questions[0];
-  broadcastRoom(code, "rapidfire_start", {
-    duration,
-    question: { q: firstQ.q, options: firstQ.options }
-  });
-
-  room.timers.rapidfire = setTimeout(() => endRapidFire(code), duration);
-  room.timers.nextQ = setTimeout(() => nextRapidFireQuestion(code), 5000);
-}
-
-function nextRapidFireQuestion(code) {
-  const room = getRoom(code);
-  if (!room || room.game !== "rapidfire") return;
-  room.gameState.currentQ++;
-  room.gameState.answers = {};
-  if (room.gameState.currentQ >= room.gameState.questions.length) {
-    room.gameState.questions = shuffle([...RAPID_FIRE]);
-    room.gameState.currentQ = 0;
+  if (room.phase !== "playing" || gs.ended) return;
+  gs.currentQ++;
+  gs.qi++;
+  gs.answers = {};
+  if (gs.currentQ >= gs.questions.length) {
+    gs.questions = shuffle(RAPID_FIRE);
+    gs.currentQ = 0;
   }
-  const curQ = room.gameState.questions[room.gameState.currentQ];
-  broadcastRoom(code, "rapidfire_question", { question: { q: curQ.q, options: curQ.options } });
-  room.timers.nextQ = setTimeout(() => nextRapidFireQuestion(code), 5000);
+  const q = gs.questions[gs.currentQ];
+  pub(room, "rapidfire_question", { question: { q: q.q, options: q.options }, qi: gs.qi }, true);
+  gs.qTimer = later(room, () => nextRapidFireQuestion(room), 5000);
 }
 
-function endRapidFire(code) {
-  clearTimeout(rooms[code]?.timers.nextQ);
-  broadcastRoom(code, "rapidfire_end", { players: getSortedPlayers(rooms[code]) });
-  setTimeout(() => endGame(code), 3000);
+function endRapidFire(room) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || gs.ended) return;
+  gs.ended = true;
+  cancel(room, gs.qTimer);
+  pub(room, "rapidfire_end", { players: getSortedPlayers(room) });
+  later(room, () => endGame(room), 3000);
 }
 
-function handleAnswer(code, playerId, answer, time) {
-  const room = getRoom(code);
-  if (!room) return;
+/* ─── HOT POTATO ───────────────────────────────────────────────────── */
+
+const FUSE_RANGES = { short: [10000, 20000], medium: [15000, 35000], long: [25000, 50000] };
+
+function startPotatoRound(room) {
+  resetReplay(room);
+  const active = activePlayers(room);
+  if (active.length < 2) return endGame(room);
+  const live = active.filter(p => !p.disconnected);
+  const holder = (live.length ? live : active)[rand((live.length ? live : active).length)];
+  const [lo, hi] = FUSE_RANGES[room.settings.fuse];
+  const gs = { holder: holder.id, prev: null, passes: 0, busy: false, done: false };
+  room.gameState = gs;
+
+  pub(room, "potato_round", {
+    round: room.round,
+    holderId: holder.id,
+    holderName: holder.name,
+    players: active.map(p => ({ id: p.id, name: p.name, avatar: p.avatar }))
+  });
+  gs.fuseTimer = later(room, () => explodePotato(room), lo + Math.random() * (hi - lo));
+  watchHolder(room);
+}
+
+function potatoTargets(room, fromId) {
+  const gs = room.gameState;
+  const active = activePlayers(room);
+  return active.filter(p => p.id !== fromId && (active.length <= 2 || p.id !== gs.prev));
+}
+
+function passPotato(room, fromId, toId) {
+  const gs = room.gameState;
+  const from = findPlayer(room, fromId);
+  const to = findPlayer(room, toId);
+  if (!from || !to) return;
+  gs.prev = fromId;
+  gs.holder = toId;
+  gs.passes++;
+  pub(room, "potato_pass", {
+    fromId, fromName: from.name, toId, toName: to.name, passes: gs.passes
+  }, true);
+  watchHolder(room);
+}
+
+function watchHolder(room) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs || gs.done || gs.busy) return;
+  const holder = findPlayer(room, gs.holder);
+  if (holder && !holder.disconnected) return;
+  cancel(room, gs.autoTimer);
+  gs.autoTimer = later(room, () => {
+    const h = findPlayer(room, gs.holder);
+    if (gs.done || (h && !h.disconnected)) return;
+    const targets = potatoTargets(room, gs.holder);
+    const live = targets.filter(p => !p.disconnected);
+    const pool = live.length ? live : targets;
+    if (!pool.length) return;
+    passPotato(room, gs.holder, pool[rand(pool.length)].id);
+  }, 1500);
+}
+
+function explodePotato(room) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs || gs.done) return;
+  gs.done = true;
+  gs.busy = true;
+  cancel(room, gs.autoTimer);
+  const victim = findPlayer(room, gs.holder);
+  if (victim) victim.eliminated = true;
+  const survivors = activePlayers(room);
+  survivors.forEach(p => { p.score += 100; });
+  const finished = survivors.length <= 1;
+  if (finished && survivors[0]) survivors[0].score += 200;
+
+  pub(room, "potato_boom", {
+    id: gs.holder,
+    name: victim ? victim.name : "",
+    passes: gs.passes,
+    remaining: survivors.length,
+    gameOver: finished,
+    players: getSortedPlayers(room)
+  });
+  if (finished) later(room, () => endGame(room), 4000);
+  else later(room, () => { room.round++; startPotatoRound(room); }, 4000);
+}
+
+/* ─── ANSWER ROUTER ────────────────────────────────────────────────── */
+
+function handleAnswer(room, p, data) {
+  if (room.phase !== "playing" || p.eliminated) return;
+  const gs = room.gameState;
+  const answer = data.answer;
+  if (!gs || !Object.keys(gs).length || !Number.isInteger(answer)) return;
 
   if (room.game === "trivial") {
-    if (room.gameState.answers[playerId] !== undefined) return;
-    room.gameState.answers[playerId] = answer;
-    broadcastRoom(code, "trivial_answer_received", { playerId, total: Object.keys(room.gameState.answers).length });
-    if (Object.keys(room.gameState.answers).length >= room.players.filter(p => !p.eliminated && !p.disconnected).length) {
-      clearTimeout(room.timers.question);
-      revealTrivialAnswer(code);
-    }
+    if (gs.revealed || answer < 0 || answer >= gs.question.options.length || gs.answers[p.id] !== undefined) return;
+    gs.answers[p.id] = answer;
+    toRoom(room, "trivial_answer_received", { playerId: p.id, total: Object.keys(gs.answers).length });
+    if (allAnswered(room, gs.answers)) revealTrivial(room);
   } else if (room.game === "mathquiz") {
-    if (room.gameState.answers[playerId]) return;
-    room.gameState.answers[playerId] = { answer, time };
-    broadcastRoom(code, "math_answer_received", { playerId, total: Object.keys(room.gameState.answers).length });
-    if (Object.keys(room.gameState.answers).length >= room.players.filter(p => !p.eliminated && !p.disconnected).length) {
-      clearTimeout(room.timers.question);
-      revealMathAnswer(code);
-    }
+    if (gs.revealed || answer < 0 || answer >= gs.question.options.length || gs.answers[p.id] !== undefined) return;
+    gs.answers[p.id] = { answer, at: Date.now() };
+    toRoom(room, "math_answer_received", { playerId: p.id, total: Object.keys(gs.answers).length });
+    if (allAnswered(room, gs.answers)) revealMath(room);
   } else if (room.game === "wouldyourather") {
-    if (room.gameState.votes[playerId] !== undefined) return;
-    room.gameState.votes[playerId] = answer;
-    broadcastRoom(code, "wyr_vote_received", { total: Object.values(room.gameState.votes).length });
-    if (Object.keys(room.gameState.votes).length >= room.players.filter(p => !p.eliminated && !p.disconnected).length) {
-      clearTimeout(room.timers.question);
-      revealWYR(code);
-    }
+    if (gs.revealed || (answer !== 0 && answer !== 1) || gs.votes[p.id] !== undefined) return;
+    gs.votes[p.id] = answer;
+    toRoom(room, "wyr_vote_received", { total: Object.keys(gs.votes).length });
+    if (allAnswered(room, gs.votes)) revealWYR(room);
   } else if (room.game === "rapidfire") {
-    const gs = room.gameState;
+    if (gs.ended || data.q !== gs.qi || gs.answers[p.id] !== undefined) return;
     const q = gs.questions[gs.currentQ];
-    if (gs.answers[playerId]) return;
-    gs.answers[playerId] = answer;
+    if (answer < 0 || answer >= q.options.length) return;
+    gs.answers[p.id] = answer;
     if (answer === q.answer) {
-      const player = room.players.find(p => p.id === playerId);
-      if (player) player.score += 50;
-      io.to(playerId).emit("rapidfire_correct");
+      p.score += 50;
+      toPlayer(room, p, "rapidfire_correct");
     } else {
-      io.to(playerId).emit("rapidfire_wrong");
+      toPlayer(room, p, "rapidfire_wrong");
     }
-    broadcastRoom(code, "rapidfire_update", { players: getSortedPlayers(room) });
+    toRoom(room, "rapidfire_update", { players: getSortedPlayers(room) });
   }
 }
 
-function getSortedPlayers(room) {
-  return [...room.players].sort((a, b) => b.score - a.score).map((p, i) => ({ ...p, rank: i + 1 }));
+function skipRound(room) {
+  if (room.phase !== "playing") return;
+  const gs = room.gameState;
+  switch (room.game) {
+    case "imposter": return startVoting(room);
+    case "trivial": return revealTrivial(room);
+    case "mathquiz": return revealMath(room);
+    case "wouldyourather": return revealWYR(room);
+    case "fasttyper": return endTyperRound(room);
+    case "wordcrack":
+    case "codebreaker":
+      if (gs && !gs.solved && !gs.closed) {
+        gs.closed = true;
+        cancel(room, gs.timer);
+        const k = GUESS_KINDS[room.game];
+        pub(room, k.timeout, { [k.key]: gs.secret });
+        advance(room, 4000);
+      }
+      return;
+  }
 }
 
-function endGame(code) {
-  const room = getRoom(code);
-  if (!room) return;
-  clearAllTimers(room);
-  room.phase = "ended";
+/* ─── SOCKET LAYER ─────────────────────────────────────────────────── */
 
-  // Update session leaderboard
-  updateSessionLeaderboard(room);
-  const sessionLB = getSessionLeaderboard();
-
-  broadcastRoom(code, "game_over", { players: getSortedPlayers(room), game: room.game });
-  // Broadcast updated session leaderboard after game ends
-  setTimeout(() => broadcastRoom(code, "session_leaderboard", { leaderboard: sessionLB }), 1000);
-
-  // Reset ready flags and phase → lobby after a short delay so players can return to waiting
-  setTimeout(() => {
-    if (!getRoom(code)) return;
-    room.phase = "lobby";
-    room.players.forEach(p => { p.ready = false; });
-    broadcastRoom(code, "room_state", getRoomState(room));
-  }, 6000);
+function on(socket, ev, fn) {
+  socket.on(ev, (data) => {
+    const now = Date.now();
+    const rl = socket.data.rl || (socket.data.rl = { t: now, n: 0 });
+    if (now - rl.t > 1000) { rl.t = now; rl.n = 0; }
+    if (++rl.n > 60) return;
+    try {
+      fn(data && typeof data === "object" ? data : {});
+    } catch (e) {
+      console.error(`[${ev}]`, e);
+    }
+  });
 }
 
-function clearAllTimers(room) {
-  Object.values(room.timers || {}).forEach(t => clearTimeout(t));
-  room.timers = {};
+function playerCtx(socket, code) {
+  const room = rooms[normCode(code)];
+  if (!room || socket.data.roomCode !== room.code) return {};
+  touch(room);
+  return { room, p: findPlayer(room, socket.data.pid) };
 }
 
-const PORT = process.env.PORT || 3000;
+function hostRoom(socket, code) {
+  const room = rooms[normCode(code)];
+  if (!room || room.hostSocketId !== socket.id) return null;
+  touch(room);
+  return room;
+}
+
+function attachPlayer(socket, room, p, reconnect) {
+  const grace = graceTimers.get(p.token);
+  if (grace) { clearTimeout(grace); graceTimers.delete(p.token); }
+
+  if (p.socketId && p.socketId !== socket.id && io.sockets && io.sockets.sockets) {
+    const old = io.sockets.sockets.get(p.socketId);
+    if (old) { old.leave(room.code); old.data.pid = null; old.data.roomCode = null; }
+  }
+  p.socketId = socket.id;
+  p.disconnected = false;
+  p.gone = false;
+  socket.join(room.code);
+  socket.data.roomCode = room.code;
+  socket.data.pid = p.id;
+
+  socket.emit("joined", { player: publicPlayer(p), code: room.code, reconnectToken: p.token });
+  socket.emit("session_leaderboard", { leaderboard: getSessionLeaderboard(room) });
+  if (reconnect) toRoom(room, "player_reconnected", { id: p.id, name: p.name });
+  toRoom(room, "room_state", getRoomState(room));
+  if (room.phase === "playing") {
+    replayToPlayer(room, p);
+    afterPresenceChange(room);
+  }
+}
+
+function sendHostState(socket, room, resumed) {
+  socket.emit("room_created", { code: room.code, hostKey: room.hostKey, resumed: !!resumed });
+  socket.emit("room_state", getRoomState(room));
+  socket.emit("session_leaderboard", { leaderboard: getSessionLeaderboard(room) });
+  pendingDisplays.forEach(id => {
+    io.to(id).emit("display_room", { code: room.code });
+  });
+}
+
+function attachDisplay(socket, room) {
+  pendingDisplays.delete(socket.id);
+  socket.join(room.code);
+  socket.join(room.code + ":d");
+  socket.data.displayRoom = room.code;
+  socket.emit("display_room", { code: room.code });
+  socket.emit("room_state", getRoomState(room));
+  if (room.phase === "playing" && room.game) {
+    socket.emit("game_selected", { game: room.game });
+    replayEvents(room, room.replay, (ev, d) => socket.emit(ev, d));
+  }
+}
+
+io.on("connection", (socket) => {
+
+  on(socket, "create_room", ({ hostCode }) => {
+    const ip = socketIp(socket);
+    if (!attemptAllowed(ip)) return socket.emit("auth_failed", { msg: "Too many attempts" });
+    if (typeof hostCode !== "string" || !safeEq(hostCode.toUpperCase(), HOST_CODE)) {
+      recordFailure(ip);
+      return socket.emit("auth_failed", { msg: "Invalid host code" });
+    }
+    const room = newRoom();
+    room.hostSocketId = socket.id;
+    latestRoomCode = room.code;
+    socket.join(room.code);
+    socket.data.hostRoom = room.code;
+    sendHostState(socket, room, false);
+  });
+
+  on(socket, "host_resume", ({ code, hostKey }) => {
+    const room = rooms[normCode(code)];
+    if (!room || typeof hostKey !== "string" || !safeEq(hostKey, room.hostKey)) {
+      return socket.emit("host_resume_failed");
+    }
+    room.hostSocketId = socket.id;
+    room.hostConnected = true;
+    latestRoomCode = room.code;
+    touch(room);
+    socket.join(room.code);
+    socket.data.hostRoom = room.code;
+    sendHostState(socket, room, true);
+  });
+
+  on(socket, "display_join", ({ code }) => {
+    const wanted = normCode(code);
+    const room = wanted ? rooms[wanted] : rooms[latestRoomCode];
+    if (!room) {
+      if (wanted) return socket.emit("error", { msg: "Room not found" });
+      pendingDisplays.add(socket.id);
+      return socket.emit("display_waiting");
+    }
+    attachDisplay(socket, room);
+  });
+
+  on(socket, "player_join", ({ code, name, avatar, reconnectToken }) => {
+    const room = rooms[normCode(code)];
+    if (!room) return socket.emit("error", { msg: "Room not found" });
+    touch(room);
+
+    if (socket.data.roomCode === room.code && findPlayer(room, socket.data.pid)) return;
+
+    if (typeof reconnectToken === "string" && reconnectToken) {
+      const ghost = room.players.find(p => p.token === reconnectToken);
+      if (ghost) return attachPlayer(socket, room, ghost, true);
+    }
+
+    const clean = cleanName(name);
+    if (!clean) return socket.emit("error", { msg: "Enter your name" });
+    if (room.players.length >= MAX_PLAYERS) return socket.emit("error", { msg: "Room is full" });
+    if (room.players.some(p => p.name.toLowerCase() === clean.toLowerCase())) {
+      return socket.emit("error", { msg: "Name already taken" });
+    }
+
+    const player = {
+      id: crypto.randomBytes(6).toString("hex"),
+      token: crypto.randomUUID(),
+      socketId: null,
+      name: clean,
+      avatar: cleanAvatar(avatar),
+      score: 0, lives: 3, eliminated: false, ready: false, disconnected: false, gone: false
+    };
+    room.players.push(player);
+    attachPlayer(socket, room, player, false);
+  });
+
+  on(socket, "player_ready", ({ code }) => {
+    const { room, p } = playerCtx(socket, code);
+    if (!p) return;
+    p.ready = !p.ready;
+    toRoom(room, "room_state", getRoomState(room));
+  });
+
+  on(socket, "player_answer", (d) => {
+    const { room, p } = playerCtx(socket, d.code);
+    if (p) handleAnswer(room, p, d);
+  });
+
+  on(socket, "player_tap", ({ code }) => {
+    const { room, p } = playerCtx(socket, code);
+    if (p && room.phase === "playing" && room.game === "reaction") handleReactionTap(room, p);
+  });
+
+  on(socket, "player_emergency", ({ code }) => {
+    const { room, p } = playerCtx(socket, code);
+    if (!p || room.phase !== "playing" || room.game !== "imposter" || p.eliminated) return;
+    const gs = room.gameState;
+    if (gs.phase !== "hint" || gs.emergencyUsed[p.id]) return;
+    gs.emergencyUsed[p.id] = true;
+    toRoom(room, "emergency_called", { by: p.name });
+    startVoting(room);
+  });
+
+  on(socket, "player_vote", ({ code, targetId }) => {
+    const { room, p } = playerCtx(socket, code);
+    if (!p || room.phase !== "playing" || room.game !== "imposter" || p.eliminated) return;
+    const gs = room.gameState;
+    if (gs.phase !== "voting" || gs.votes[p.id] !== undefined) return;
+    const target = findPlayer(room, targetId);
+    if (!target || target.eliminated || target.id === p.id) return;
+    gs.votes[p.id] = target.id;
+    toRoom(room, "vote_cast", {
+      voterId: p.id,
+      totalVotes: Object.keys(gs.votes).length,
+      totalVoters: livePlayers(room).length
+    });
+    if (allAnswered(room, gs.votes)) resolveVoting(room);
+  });
+
+  on(socket, "player_shoot", ({ code, spin }) => {
+    const { room, p } = playerCtx(socket, code);
+    if (!p || room.game !== "roulette") return;
+    if (spin) rouletteSpin(room, p);
+    else rouletteShoot(room, p.id, false);
+  });
+
+  on(socket, "player_guess", ({ code, guess }) => {
+    const { room, p } = playerCtx(socket, code);
+    if (p) handleGuess(room, p, guess);
+  });
+
+  on(socket, "player_typing_done", (d) => {
+    const { room, p } = playerCtx(socket, d.code);
+    if (p && room.game === "fasttyper") handleTypingDone(room, p, d);
+  });
+
+  on(socket, "player_pass", ({ code, targetId }) => {
+    const { room, p } = playerCtx(socket, code);
+    if (!p || room.phase !== "playing" || room.game !== "hotpotato") return;
+    const gs = room.gameState;
+    if (gs.done || gs.holder !== p.id) return;
+    const ok = potatoTargets(room, p.id).find(t => t.id === targetId);
+    if (!ok) return toPlayer(room, p, "potato_denied", { msg: "You cannot pass to that player" });
+    passPotato(room, p.id, ok.id);
+  });
+
+  on(socket, "request_session_leaderboard", ({ code }) => {
+    const { room } = playerCtx(socket, code);
+    if (room) socket.emit("session_leaderboard", { leaderboard: getSessionLeaderboard(room) });
+  });
+
+  on(socket, "request_room_state", ({ code }) => {
+    const { room } = playerCtx(socket, code);
+    if (room) socket.emit("room_state", getRoomState(room));
+  });
+
+  on(socket, "host_kick", ({ code, playerId }) => {
+    const room = hostRoom(socket, code);
+    if (!room) return;
+    const kicked = findPlayer(room, playerId);
+    if (!kicked) return;
+    const t = graceTimers.get(kicked.token);
+    if (t) { clearTimeout(t); graceTimers.delete(kicked.token); }
+    room.players = room.players.filter(p => p.id !== playerId);
+    if (kicked.socketId) {
+      io.to(kicked.socketId).emit("kicked");
+      const s = io.sockets && io.sockets.sockets && io.sockets.sockets.get(kicked.socketId);
+      if (s) { s.leave(room.code); s.data.roomCode = null; s.data.pid = null; }
+    }
+    toRoom(room, "room_state", getRoomState(room));
+    afterPresenceChange(room);
+  });
+
+  on(socket, "host_select_game", ({ code, game, settings }) => {
+    const room = hostRoom(socket, code);
+    if (!room || room.phase === "playing") return;
+    const clean = cleanSettings(game, settings);
+    if (!clean) return socket.emit("error", { msg: "Unknown game" });
+    room.game = game;
+    room.settings = clean;
+    room.questions = game === "trivial" ? cleanQuestions(settings && settings.questions) : null;
+    room.phase = "settings";
+    room.players.forEach(p => { p.score = 0; p.lives = 3; p.eliminated = false; p.ready = false; });
+    toRoom(room, "game_selected", { game, settings: publicSettings(room) });
+    toRoom(room, "room_state", getRoomState(room));
+  });
+
+  on(socket, "host_start_game", ({ code }) => {
+    const room = hostRoom(socket, code);
+    if (!room || room.phase !== "settings" || !room.game) return;
+    const min = MIN_PLAYERS[room.game] || 2;
+    const connected = room.players.filter(p => !p.disconnected).length;
+    if (connected < min) return socket.emit("error", { msg: `Need at least ${min} connected players` });
+    startGame(room);
+  });
+
+  on(socket, "host_next_round", ({ code }) => {
+    const room = hostRoom(socket, code);
+    if (room) skipRound(room);
+  });
+
+  on(socket, "host_show_leaderboard", ({ code }) => {
+    const room = hostRoom(socket, code);
+    if (room) toRoom(room, "show_leaderboard", { players: getSortedPlayers(room) });
+  });
+
+  on(socket, "host_show_session_leaderboard", ({ code }) => {
+    const room = hostRoom(socket, code);
+    if (room) toRoom(room, "session_leaderboard", { leaderboard: getSessionLeaderboard(room) });
+  });
+
+  on(socket, "host_end_game", ({ code }) => {
+    const room = hostRoom(socket, code);
+    if (!room) return;
+    if (room.phase === "playing") endGame(room);
+    else if (room.phase === "settings") {
+      room.phase = "lobby";
+      toRoom(room, "room_state", getRoomState(room));
+    }
+  });
+
+  on(socket, "host_reset_session_leaderboard", ({ code }) => {
+    const room = hostRoom(socket, code);
+    if (!room) return;
+    room.lb = {};
+    toRoom(room, "session_leaderboard", { leaderboard: [] });
+  });
+
+  socket.on("disconnect", () => {
+    pendingDisplays.delete(socket.id);
+    const hostCode = socket.data.hostRoom;
+    if (hostCode && rooms[hostCode] && rooms[hostCode].hostSocketId === socket.id) {
+      rooms[hostCode].hostConnected = false;
+    }
+
+    const room = rooms[socket.data.roomCode];
+    if (!room) return;
+    const p = findPlayer(room, socket.data.pid);
+    if (!p || p.socketId !== socket.id) return;
+
+    p.disconnected = true;
+    toRoom(room, "player_disconnected", { id: p.id, name: p.name });
+    toRoom(room, "room_state", getRoomState(room));
+    afterPresenceChange(room);
+
+    const token = p.token;
+    const timer = setTimeout(() => {
+      graceTimers.delete(token);
+      if (!rooms[room.code] || !p.disconnected) return;
+      if (room.phase === "playing") {
+        p.gone = true;
+      } else {
+        room.players = room.players.filter(x => x.token !== token);
+        toRoom(room, "room_state", getRoomState(room));
+      }
+    }, GRACE_MS);
+    graceTimers.set(token, timer);
+  });
+});
+
+setInterval(() => {
+  const now = Date.now();
+  Object.values(rooms).forEach(room => {
+    const anyone = room.hostConnected || room.players.some(p => !p.disconnected);
+    if (!anyone && now - room.lastActive > 2 * 60 * 60 * 1000) deleteRoom(room);
+  });
+}, 10 * 60 * 1000).unref();
+
 server.listen(PORT, "0.0.0.0", () => {
   const ip = getLocalIP();
   const publicUrl = process.env.RENDER_EXTERNAL_URL || `http://${ip}:${PORT}`;
-  console.log("\n🎮 Game Night Server Running!");
-  console.log(`\n   ╔══════════════════════════════════╗`);
-  console.log(`   ║  HOST CODE: ${HOST_CODE}              ║`);
-  console.log(`   ║  Keep this secret!               ║`);
-  console.log(`   ╚══════════════════════════════════╝`);
+  console.log("\nGame Night Server Running!");
+  console.log("\n   ╔════════════════════════════════════╗");
+  console.log(`   ║  HOST CODE: ${HOST_CODE}                ║`);
+  console.log("   ║  Keep this secret!                 ║");
+  console.log("   ╚════════════════════════════════════╝");
   console.log(`\n   Host Panel  → ${publicUrl}/host?code=${HOST_CODE}`);
+  console.log(`   Display     → ${publicUrl}/display`);
   console.log(`   Players     → ${publicUrl}`);
   console.log(`\n   Share with players: ${publicUrl}\n`);
 });

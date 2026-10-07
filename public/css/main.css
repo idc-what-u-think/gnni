@@ -342,3 +342,18 @@ body {
   animation: slideUp 0.3s ease; display: flex; align-items: center; gap: 8px;
   box-shadow: 0 8px 32px rgba(0,0,0,0.4);
 }
+
+.potato {
+  font-size: 96px; text-align: center; transition: transform 0.2s;
+  filter: drop-shadow(0 0 20px rgba(245,158,11,0.4));
+}
+.potato.hot {
+  animation: potatoShake 0.35s infinite;
+  filter: drop-shadow(0 0 30px rgba(239,68,68,0.8));
+}
+.potato-big { font-size: 160px; text-align: center; }
+.potato-big.hot { animation: potatoShake 0.35s infinite; filter: drop-shadow(0 0 40px rgba(239,68,68,0.8)); }
+@keyframes potatoShake {
+  0%, 100% { transform: rotate(-6deg) scale(1.05); }
+  50% { transform: rotate(6deg) scale(1.15); }
+}
