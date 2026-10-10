@@ -23,7 +23,8 @@ const GAMES = [
   { id: "codebreaker", icon: "🔐", name: "Code Breaker", desc: "Crack the 4-digit code", min: 2 },
   { id: "roulette", icon: "🎰", name: "Russian Roulette", desc: "Spin. Shoot. Survive.", min: 2 },
   { id: "rapidfire", icon: "🔥", name: "Rapid Fire", desc: "60 seconds of chaos", min: 2 },
-  { id: "hotpotato", icon: "🥔", name: "Hot Potato", desc: "Pass it before it blows", min: 3 }
+  { id: "hotpotato", icon: "🥔", name: "Hot Potato", desc: "Pass it before it blows", min: 3 },
+  { id: "wordchain", icon: "🔗", name: "Word Chain", desc: "Next word starts where the last ended", min: 2 }
 ];
 
 const SETTINGS = {
@@ -61,6 +62,11 @@ const SETTINGS = {
   ],
   rapidfire: [
     { key: "duration", label: "Duration (seconds)", type: "number", default: 60, min: 30, max: 180 }
+  ],
+  wordchain: [
+    { key: "mode", label: "On a Mistake", type: "select", default: "lives", options: [{ v: "lives", l: "3 Lives" }, { v: "sudden", l: "Instant Elimination" }] },
+    { key: "rules", label: "Rule Rounds", type: "select", default: "on", options: [{ v: "on", l: "On (random rounds)" }, { v: "off", l: "Off" }] },
+    { key: "rounds", label: "Max Rounds", type: "number", default: 15, min: 5, max: 30 }
   ],
   hotpotato: [
     { key: "fuse", label: "Fuse Length", type: "select", default: "medium", options: [{ v: "short", l: "Short (10-20s)" }, { v: "medium", l: "Medium (15-35s)" }, { v: "long", l: "Long (25-50s)" }] }

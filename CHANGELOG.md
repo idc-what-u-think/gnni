@@ -3,6 +3,8 @@
 ## Added
 - Hot Potato game (3 to 12 players): hidden random fuse, pass the potato to anyone except yourself and the player who just passed it to you. When it blows the holder is out. Survivors earn 100 points per round, the last player standing earns a 200 bonus. If the holder disconnects the potato is passed automatically. Fuse setting: short, medium, long.
 
+- Word Chain game (2 to 15 players): each word must start with the last letter of the previous word. Turn timer by round is 15s, 10s, 8s, 6s, then 5s from round 5 on. A round is one full lap. Random rule rounds (never two in a row, never round 1) can be switched off in settings. A valid word scores 10 + its length + up to 5 for speed. Running out of time costs 5 points (never below 0) and a life, or instant elimination in sudden mode. Wrong or invalid words are rejected and the player can retry until the timer ends. Last player standing gets +50. Words come from a bundled dictionary at data/words.txt.
+
 ## Fixed
 - Host page is no longer served from /host.html or /public. It is served only from /host?code=HOSTCODE.
 - QR code now encodes the correct join URL for the request host.

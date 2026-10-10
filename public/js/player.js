@@ -77,6 +77,7 @@ function clearTimers() {
   clearInterval(trivTimer);
   clearInterval(mathTimer);
   clearInterval(voteTimer);
+  clearInterval(chainTimer);
 }
 
 function runBar(barId, duration, holder) {
@@ -284,7 +285,7 @@ function gameLabel(g) {
   const map = { imposter:"Who is the Imposter", trivial:"Trivial Quiz", reaction:"Reaction Royale",
     wouldyourather:"Would You Rather", mathquiz:"Math Quiz", fasttyper:"Fastest Typer",
     wordcrack:"Word Crack", codebreaker:"Code Breaker", roulette:"Russian Roulette", rapidfire:"Rapid Fire",
-    hotpotato:"Hot Potato" };
+    hotpotato:"Hot Potato", wordchain:"Word Chain" };
   return map[g] || g;
 }
 
@@ -1144,4 +1145,119 @@ socket.on("show_leaderboard", ({ players }) => {
       <span class="player-score">${p.score}</span>
     </div>
   `).join("");
+});
+
+
+/* ─── WORD CHAIN ──────────────────────────────────────────────────── */
+
+let chainTimer = null;
+let chainCurrent = null;
+let chainLetter = "";
+let chainBusy = false;
+
+function chainBar(duration) {
+  clearInterval(chainTimer);
+  const end = Date.now() + duration;
+  $("chainBar").style.width = "100%";
+  chainTimer = setInterval(() => {
+    const left = Math.max(0, end - Date.now());
+    $("chainBar").style.width = (left / duration * 100) + "%";
+    $("chainSecs").textContent = Math.ceil(left / 1000);
+    if (left <= 0) clearInterval(chainTimer);
+  }, 100);
+}
+
+function chainRecent(list) {
+  $("chainRecent").innerHTML = (list || []).map(r => `<span class="tag tag-cyan">${esc(r.word)}</span>`).join(" ");
+}
+
+function chainLives(players) {
+  const me = (players || []).find(p => p.id === myId);
+  if (!me) return;
+  $("chainLives").textContent = me.eliminated ? "Out" : "Lives " + me.lives;
+  $("chainScore").textContent = me.score + " pts";
+}
+
+socket.on("chain_round", ({ round, total, seconds, rule, order }) => {
+  clearInterval(chainTimer);
+  chainCurrent = null;
+  $("chainRound").textContent = round + " / " + total;
+  const banner = $("chainRule");
+  banner.style.display = rule ? "block" : "none";
+  banner.textContent = rule ? "RULE ROUND: " + rule : "";
+  $("chainMsg").textContent = rule ? "New rule this round" : `${seconds}s per turn`;
+  $("chainInputBox").style.display = "none";
+  $("chainFeedback").textContent = "";
+  if (!order.some(p => p.id === myId)) { showScreen("spectator"); return; }
+  showScreen("wordchain");
+});
+
+socket.on("chain_turn", ({ playerId, name, letter, duration, rule, recent, players }) => {
+  chainCurrent = playerId;
+  chainLetter = letter;
+  chainBusy = false;
+  showScreen("wordchain");
+  const rb = $("chainRule");
+  rb.style.display = rule ? "block" : "none";
+  rb.textContent = rule ? "RULE ROUND: " + rule : "";
+  $("chainLetter").textContent = letter.toUpperCase();
+  chainRecent(recent);
+  chainLives(players);
+  chainBar(duration);
+  const mine = playerId === myId;
+  $("chainInputBox").style.display = mine ? "block" : "none";
+  $("chainCard").classList.toggle("your-turn-glow", mine);
+  $("chainFeedback").textContent = "";
+  if (mine) {
+    $("chainMsg").textContent = `Your turn: word starting with ${letter.toUpperCase()}`;
+    const inp = $("chainInput");
+    inp.value = "";
+    inp.disabled = false;
+    inp.focus();
+    if (navigator.vibrate) navigator.vibrate(80);
+  } else {
+    $("chainMsg").textContent = `${name} is thinking...`;
+  }
+});
+
+function sendChainWord() {
+  if (chainCurrent !== myId || chainBusy) return;
+  const w = $("chainInput").value.trim();
+  if (!w) return;
+  socket.emit("player_word", { code: roomCode, word: w });
+}
+
+$("chainSend").onclick = sendChainWord;
+$("chainInput").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); sendChainWord(); } });
+
+socket.on("chain_rejected", ({ msg }) => {
+  $("chainFeedback").innerHTML = `<span class="text-danger">${esc(msg)}</span>`;
+  if (navigator.vibrate) navigator.vibrate(60);
+});
+
+socket.on("chain_word", ({ playerId, name, word, points, nextLetter, players }) => {
+  clearInterval(chainTimer);
+  chainBusy = true;
+  chainCurrent = null;
+  $("chainInputBox").style.display = "none";
+  $("chainCard").classList.remove("your-turn-glow");
+  $("chainMsg").textContent = `${name}: ${word} (+${points})`;
+  $("chainFeedback").textContent = `Next letter: ${nextLetter.toUpperCase()}`;
+  chainLives(players);
+});
+
+socket.on("chain_fail", ({ playerId, name, reason, lives, eliminated, penalty, gameOver, winnerId, players }) => {
+  clearInterval(chainTimer);
+  chainBusy = true;
+  chainCurrent = null;
+  $("chainInputBox").style.display = "none";
+  $("chainCard").classList.remove("your-turn-glow");
+  chainLives(players);
+  const you = playerId === myId;
+  $("chainMsg").textContent = you ? `${reason}. -${penalty} pts` : `${name}: ${reason}`;
+  $("chainFeedback").innerHTML = eliminated
+    ? `<span class="text-danger">${you ? "You are out" : esc(name) + " is out"}</span>`
+    : `${you ? "You have" : esc(name) + " has"} ${lives} ${lives === 1 ? "life" : "lives"} left`;
+  if (you && eliminated) setTimeout(() => showScreen("spectator"), 3000);
+  if (gameOver && winnerId === myId) $("chainFeedback").textContent = "You win! +50 bonus";
 });

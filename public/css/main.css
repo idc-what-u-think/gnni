@@ -357,3 +357,12 @@ body {
   0%, 100% { transform: rotate(-6deg) scale(1.05); }
   50% { transform: rotate(6deg) scale(1.15); }
 }
+
+.chain-letter {
+  font-size: 96px; font-weight: 800; line-height: 1; color: var(--accent);
+  font-family: var(--font-mono); text-shadow: 0 0 30px rgba(124,58,237,0.5);
+}
+.chain-letter-big {
+  font-size: 200px; font-weight: 800; line-height: 1.1; color: var(--accent);
+  font-family: var(--font-mono); text-shadow: 0 0 50px rgba(124,58,237,0.5);
+}

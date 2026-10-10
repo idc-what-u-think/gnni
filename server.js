@@ -5,6 +5,7 @@ const QRCode = require("qrcode");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
+const fs = require("fs");
 
 const app = express();
 const server = http.createServer(app);
@@ -219,10 +220,15 @@ const SETTING_DEFS = {
   codebreaker: { rounds: { min: 2, max: 10, def: 5 } },
   roulette: { mode: { opts: ["laststanding", "mostrounds"], def: "laststanding" } },
   rapidfire: { duration: { min: 30, max: 180, def: 60 } },
-  hotpotato: { fuse: { opts: ["short", "medium", "long"], def: "medium" } }
+  hotpotato: { fuse: { opts: ["short", "medium", "long"], def: "medium" } },
+  wordchain: {
+    rounds: { min: 5, max: 30, def: 15 },
+    mode: { opts: ["lives", "sudden"], def: "lives" },
+    rules: { opts: ["on", "off"], def: "on" }
+  }
 };
 
-const MIN_PLAYERS = { imposter: 3, hotpotato: 3 };
+const MIN_PLAYERS = { imposter: 3, hotpotato: 3, wordchain: 2 };
 
 function cleanSettings(game, raw) {
   const defs = SETTING_DEFS[game];
@@ -608,6 +614,7 @@ function prepareGame(room) {
     case "reaction":
     case "mathquiz":
     case "codebreaker":
+    case "wordchain":
       room.total = s.rounds;
       break;
   }
@@ -639,6 +646,7 @@ function startRound(room) {
     case "roulette": return startRouletteRound(room);
     case "rapidfire": return startRapidFireRound(room);
     case "hotpotato": return startPotatoRound(room);
+    case "wordchain": return startChainRound(room);
   }
 }
 
@@ -1285,6 +1293,165 @@ function explodePotato(room) {
   else later(room, () => { room.round++; startPotatoRound(room); }, 4000);
 }
 
+/* ─── WORD CHAIN ───────────────────────────────────────────────────── */
+
+const DICT = new Set();
+try {
+  fs.readFileSync(path.join(__dirname, "data", "words.txt"), "utf8").split(/\r?\n/).forEach(w => {
+    w = w.trim().toLowerCase();
+    if (/^[a-z]{3,24}$/.test(w)) DICT.add(w);
+  });
+} catch (e) {
+  console.error("Word Chain dictionary missing: data/words.txt");
+}
+
+const CHAIN_TIMES = [15, 10, 8, 6, 5];
+const CHAIN_START_LETTERS = "abcdefghilmnoprstw";
+const CHAIN_MIN_LEN = 3;
+const CHAIN_FAIL_PENALTY = 5;
+const CHAIN_WINNER_BONUS = 50;
+
+const CHAIN_RULES = [
+  { id: "len45", text: () => "Word must be 4 or 5 letters long", ok: w => w.length >= 4 && w.length <= 5 },
+  { id: "min6", text: () => "Word must be at least 6 letters long", ok: w => w.length >= 6 },
+  { id: "max4", text: () => "Word must be 4 letters or fewer", ok: w => w.length <= 4 },
+  { id: "has", param: () => "aeiorstnl"[rand(9)], text: l => `Word must contain the letter ${l.toUpperCase()}`, ok: (w, l) => w.includes(l) },
+  { id: "hasnot", param: letter => { const pool = "qjxzkvbwf".replace(letter, ""); return pool[rand(pool.length)]; }, text: l => `Word must NOT contain the letter ${l.toUpperCase()}`, ok: (w, l) => !w.includes(l) },
+  { id: "norepeat", text: () => "No repeated letters inside the word", ok: w => new Set(w).size === w.length },
+  { id: "double", text: () => "Word must have a double letter (like coffee)", ok: w => /(.)\1/.test(w) },
+  { id: "diffends", text: () => "Word must start and end with different letters", ok: w => w[0] !== w[w.length - 1] }
+];
+
+function chainTurnMs(round) {
+  return CHAIN_TIMES[Math.min(round, CHAIN_TIMES.length) - 1] * 1000;
+}
+
+function startChainRound(room) {
+  resetReplay(room);
+  if (DICT.size < 1000) {
+    toRoom(room, "error", { msg: "Word Chain dictionary is missing on the server" });
+    return endGame(room);
+  }
+  let gs = room.gameState;
+  if (!gs || !gs.used) {
+    gs = room.gameState = {
+      used: new Set(), recent: [], letter: CHAIN_START_LETTERS[rand(CHAIN_START_LETTERS.length)],
+      rule: null, ruleParam: null, lastRuleRound: 0, current: null, idx: -1, order: [], busy: false, turnEnds: 0
+    };
+  }
+  cancel(room, gs.turnTimer);
+  gs.order = activePlayers(room).map(p => p.id);
+  gs.idx = -1;
+  gs.busy = false;
+  gs.rule = null;
+  gs.ruleParam = null;
+
+  if (room.settings.rules === "on" && room.round >= 2 && gs.lastRuleRound !== room.round - 1 && Math.random() < 0.35) {
+    const rule = CHAIN_RULES[rand(CHAIN_RULES.length)];
+    gs.rule = rule;
+    gs.ruleParam = rule.param ? rule.param(gs.letter) : null;
+    gs.lastRuleRound = room.round;
+  }
+
+  gs.ms = chainTurnMs(room.round);
+  pub(room, "chain_round", {
+    round: room.round,
+    total: room.total,
+    seconds: gs.ms / 1000,
+    rule: gs.rule ? gs.rule.text(gs.ruleParam) : null,
+    order: gs.order.map(id => { const p = findPlayer(room, id); return { id, name: p.name, avatar: p.avatar }; })
+  }, true);
+  later(room, () => chainNextTurn(room), gs.rule ? 3500 : 1200);
+}
+
+function chainNextTurn(room) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs || !gs.used) return;
+  gs.idx++;
+  while (gs.idx < gs.order.length) {
+    const p = findPlayer(room, gs.order[gs.idx]);
+    if (p && !p.eliminated) break;
+    gs.idx++;
+  }
+  if (gs.idx >= gs.order.length) return advance(room, 800);
+
+  const p = findPlayer(room, gs.order[gs.idx]);
+  gs.current = p.id;
+  gs.busy = false;
+  gs.turnEnds = Date.now() + gs.ms;
+  pub(room, "chain_turn", {
+    round: room.round,
+    playerId: p.id,
+    name: p.name,
+    letter: gs.letter,
+    duration: gs.ms,
+    rule: gs.rule ? gs.rule.text(gs.ruleParam) : null,
+    recent: gs.recent.slice(-6),
+    players: getSortedPlayers(room)
+  }, true);
+  gs.turnTimer = later(room, () => chainFail(room, p.id, "Time is up"), gs.ms);
+}
+
+function chainCheckWord(room, raw) {
+  const gs = room.gameState;
+  const w = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (!/^[a-z]+$/.test(w)) return { msg: "Letters only" };
+  if (w.length < CHAIN_MIN_LEN) return { msg: `At least ${CHAIN_MIN_LEN} letters` };
+  if (w[0] !== gs.letter) return { msg: `Must start with ${gs.letter.toUpperCase()}` };
+  if (gs.used.has(w)) return { msg: "Already used" };
+  if (!DICT.has(w)) return { msg: "Not in the dictionary" };
+  if (gs.rule && !gs.rule.ok(w, gs.ruleParam)) return { msg: "Breaks the round rule" };
+  return { word: w };
+}
+
+function handleChainWord(room, p, raw) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs || !gs.used || gs.busy || gs.current !== p.id || p.eliminated) return;
+  const res = chainCheckWord(room, raw);
+  if (!res.word) return toPlayer(room, p, "chain_rejected", { msg: res.msg });
+
+  gs.busy = true;
+  cancel(room, gs.turnTimer);
+  const word = res.word;
+  const left = Math.max(0, gs.turnEnds - Date.now());
+  const points = 10 + word.length + Math.floor(5 * left / gs.ms);
+  p.score += points;
+  gs.used.add(word);
+  gs.recent.push({ word, name: p.name });
+  gs.letter = word[word.length - 1];
+
+  pub(room, "chain_word", {
+    playerId: p.id, name: p.name, word, points, nextLetter: gs.letter, players: getSortedPlayers(room)
+  }, true);
+  later(room, () => chainNextTurn(room), 1300);
+}
+
+function chainFail(room, playerId, reason) {
+  const gs = room.gameState;
+  if (room.phase !== "playing" || !gs || !gs.used || gs.busy || gs.current !== playerId) return;
+  const p = findPlayer(room, playerId);
+  if (!p || p.eliminated) return;
+  gs.busy = true;
+  cancel(room, gs.turnTimer);
+
+  p.score = Math.max(0, p.score - CHAIN_FAIL_PENALTY);
+  p.lives = room.settings.mode === "sudden" ? 0 : Math.max(0, p.lives - 1);
+  if (p.lives <= 0) p.eliminated = true;
+
+  const survivors = activePlayers(room);
+  const finished = survivors.length <= 1;
+  if (finished && survivors[0]) survivors[0].score += CHAIN_WINNER_BONUS;
+
+  pub(room, "chain_fail", {
+    playerId: p.id, name: p.name, reason, lives: p.lives, eliminated: p.eliminated,
+    penalty: CHAIN_FAIL_PENALTY, nextLetter: gs.letter, gameOver: finished,
+    winnerId: finished && survivors[0] ? survivors[0].id : null,
+    players: getSortedPlayers(room)
+  }, true);
+  if (finished) later(room, () => endGame(room), 4000);
+  else later(room, () => chainNextTurn(room), 1800);
+}
+
 /* ─── ANSWER ROUTER ────────────────────────────────────────────────── */
 
 function handleAnswer(room, p, data) {
@@ -1563,6 +1730,11 @@ io.on("connection", (socket) => {
     const ok = potatoTargets(room, p.id).find(t => t.id === targetId);
     if (!ok) return toPlayer(room, p, "potato_denied", { msg: "You cannot pass to that player" });
     passPotato(room, p.id, ok.id);
+  });
+
+  on(socket, "player_word", ({ code, word }) => {
+    const { room, p } = playerCtx(socket, code);
+    if (p && room.game === "wordchain") handleChainWord(room, p, word);
   });
 
   on(socket, "request_session_leaderboard", ({ code }) => {

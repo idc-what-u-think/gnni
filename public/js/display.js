@@ -140,7 +140,7 @@ function gameLabel(g) {
   const map = { imposter:"🕵️ Who is the Imposter", trivial:"🎯 Trivial Quiz", reaction:"⚡ Reaction Royale",
     wouldyourather:"🤔 Would You Rather", mathquiz:"➕ Math Quiz", fasttyper:"⌨️ Fastest Typer",
     wordcrack:"🟩 Word Crack", codebreaker:"🔐 Code Breaker", roulette:"🎰 Russian Roulette", rapidfire:"🔥 Rapid Fire",
-    hotpotato:"🥔 Hot Potato" };
+    hotpotato:"🥔 Hot Potato", wordchain:"🔗 Word Chain" };
   return map[g] || g;
 }
 
@@ -565,11 +565,73 @@ socket.on("potato_boom", ({ name, remaining, gameOver, players }) => {
   updateLeaderboard(players);
 });
 
+/* ─── WORD CHAIN ──────────────────────────────────────────────────── */
+
+let chainTimerInterval = null;
+
+function chainDisplayBar(duration) {
+  clearInterval(chainTimerInterval);
+  const end = Date.now() + duration;
+  $("chainDisplayBar").style.width = "100%";
+  chainTimerInterval = setInterval(() => {
+    const left = Math.max(0, end - Date.now());
+    $("chainDisplayBar").style.width = (left / duration * 100) + "%";
+    if (left <= 0) clearInterval(chainTimerInterval);
+  }, 100);
+}
+
+function chainDisplayRule(rule) {
+  const el = $("chainDisplayRule");
+  el.style.display = rule ? "block" : "none";
+  el.textContent = rule ? "RULE ROUND: " + rule : "";
+}
+
+socket.on("chain_round", ({ round, total, seconds, rule }) => {
+  clearInterval(chainTimerInterval);
+  showView("wordchain");
+  $("topRound").style.display = "";
+  $("topRound").textContent = `Round ${round}`;
+  $("chainDisplayRound").textContent = `Round ${round} / ${total} • ${seconds}s per turn`;
+  $("chainDisplayTurn").style.color = "";
+  $("chainDisplayTurn").textContent = rule ? "New rule!" : "Here we go";
+  $("chainDisplaySub").textContent = "";
+  chainDisplayRule(rule);
+});
+
+socket.on("chain_turn", ({ name, letter, duration, rule, recent, players }) => {
+  showView("wordchain");
+  $("chainDisplayLetter").textContent = letter.toUpperCase();
+  $("chainDisplayTurn").style.color = "";
+  $("chainDisplayTurn").textContent = `${name}'s turn`;
+  $("chainDisplaySub").textContent = "";
+  chainDisplayRule(rule);
+  $("chainDisplayRecent").innerHTML = (recent || []).map(r => `<span class="tag tag-cyan">${esc(r.word)}</span>`).join("");
+  chainDisplayBar(duration);
+  updateLeaderboard(players);
+});
+
+socket.on("chain_word", ({ name, word, points, nextLetter, players }) => {
+  clearInterval(chainTimerInterval);
+  $("chainDisplayTurn").style.color = "var(--success)";
+  $("chainDisplayTurn").textContent = `${name}: ${word}`;
+  $("chainDisplaySub").textContent = `+${points} points. Next letter ${nextLetter.toUpperCase()}`;
+  updateLeaderboard(players);
+});
+
+socket.on("chain_fail", ({ name, reason, lives, eliminated, penalty, gameOver, players }) => {
+  clearInterval(chainTimerInterval);
+  $("chainDisplayTurn").style.color = "var(--danger)";
+  $("chainDisplayTurn").textContent = eliminated ? `${name} is OUT` : `${name}: ${reason}`;
+  $("chainDisplaySub").textContent = gameOver ? "We have a winner!" : eliminated ? `-${penalty} points` : `-${penalty} points, ${lives} ${lives === 1 ? "life" : "lives"} left`;
+  updateLeaderboard(players);
+});
+
 /* ─── GAME OVER ───────────────────────────────────────────────────── */
 
 socket.on("game_over", ({ players }) => {
   currentPlayers = players;
   clearInterval(rfTimerInterval);
+  clearInterval(chainTimerInterval);
   clearInterval(trivTimerInterval);
   clearInterval(mathTimerInterval);
   clearInterval(voteTimerInterval);
